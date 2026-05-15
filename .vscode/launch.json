@@ -1,0 +1,16 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Launch",
+            "type": "coreclr",
+            "request": "launch",
+            "preLaunchTask": "build",
+            "program": "${env:APPDATA}/Pulsar/Interim.exe",
+            "cwd": "${env:APPDATA}/Pulsar",
+            "console": "internalConsole",
+            "stopAtEntry": false,
+            "requireExactSource": false
+        }
+    ]
+}

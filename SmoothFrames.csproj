@@ -1,0 +1,65 @@
+<Project Sdk="Microsoft.NET.Sdk">
+	<PropertyGroup>
+		<ProjectGuid>{34000034-0F9B-4E5C-8C6D-11A2A0F5F401}</ProjectGuid>
+		<TargetFramework>net481</TargetFramework>
+		<PlatformTarget>x64</PlatformTarget>
+		<LangVersion>7.3</LangVersion>
+		<RootNamespace>SmoothFrames</RootNamespace>
+		<AssemblyName>SmoothFrames</AssemblyName>
+		<OutputPath>bin\$(Configuration)\</OutputPath>
+		<AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+		<GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+		<EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+		<GenerateDocumentationFile>true</GenerateDocumentationFile>
+		<DocumentationFile>obj\$(Configuration)\$(AssemblyName).xml</DocumentationFile>
+		<NoWarn>$(NoWarn);CS1591</NoWarn>
+	</PropertyGroup>
+	<ItemGroup>
+		<Reference Include="Sandbox.Common">
+			<HintPath>$(Bin64)\Sandbox.Common.dll</HintPath>
+			<Private>False</Private>
+		</Reference>
+		<Reference Include="Sandbox.Game">
+			<HintPath>$(Bin64)\Sandbox.Game.dll</HintPath>
+			<Private>False</Private>
+		</Reference>
+		<Reference Include="Sandbox.Graphics">
+			<HintPath>$(Bin64)\Sandbox.Graphics.dll</HintPath>
+			<Private>False</Private>
+		</Reference>
+		<Reference Include="VRage">
+			<HintPath>$(Bin64)\VRage.dll</HintPath>
+			<Private>False</Private>
+		</Reference>
+		<Reference Include="VRage.Game">
+			<HintPath>$(Bin64)\VRage.Game.dll</HintPath>
+			<Private>False</Private>
+		</Reference>
+		<Reference Include="VRage.Input">
+			<HintPath>$(Bin64)\VRage.Input.dll</HintPath>
+			<Private>False</Private>
+		</Reference>
+		<Reference Include="VRage.Library">
+			<HintPath>$(Bin64)\VRage.Library.dll</HintPath>
+			<Private>False</Private>
+		</Reference>
+		<Reference Include="VRage.Math">
+			<HintPath>$(Bin64)\VRage.Math.dll</HintPath>
+			<Private>False</Private>
+		</Reference>
+		<Reference Include="VRage.Render">
+			<HintPath>$(Bin64)\VRage.Render.dll</HintPath>
+			<Private>False</Private>
+		</Reference>
+		<Reference Include="VRage.Render11">
+			<HintPath>$(Bin64)\VRage.Render11.dll</HintPath>
+			<Private>False</Private>
+		</Reference>
+	</ItemGroup>
+	<ItemGroup>
+		<PackageReference Include="Lib.Harmony" Version="2.4.2" ExcludeAssets="runtime"/>
+	</ItemGroup>
+	<ItemGroup>
+		<Content Include="PluginHub.xml"/>
+	</ItemGroup>
+</Project>
