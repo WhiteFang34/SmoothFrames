@@ -72,7 +72,7 @@ namespace SmoothFrames
 		// coords and the effect would otherwise be left at the unsmoothed
 		// pose.
 		//
-		// Null / empty when no attached effects are active for this entity.
+		// Null/empty when no attached effects are active for this entity.
 		// Capturing the (id, world matrix) pair on the sim thread (instead of
 		// reading effect.WorldMatrix from the render thread) eliminates a
 		// torn-MatrixD race at sim-tick boundaries: without this, a render
@@ -96,7 +96,7 @@ namespace SmoothFrames
 		// automatically and are not captured here. See AttachedLightCapture
 		// for the rationale.
 		//
-		// Null / empty when no attached lights are active for this entity.
+		// Null/empty when no attached lights are active for this entity.
 		public AttachedLightSnapshot[] AttachedLights;
 	}
 

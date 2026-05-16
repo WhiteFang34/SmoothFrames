@@ -21,10 +21,10 @@ consistently in code comments and the rest of this doc.
 - **Swap.** A 1-frame content-identity flip — the visible slot
   of one element briefly renders another element's content.
   Distinct from flicker: flicker is the same element popping;
-  swap is the wrong element in the slot. Typically a pool-slot-
-  reuse symptom — a recycled handle (HUD message, sprite,
-  billboard) is keyed against a slot another consumer has re-
-  purposed this tick.
+  swap is the wrong element in the slot. Typically a
+  pool-slot-reuse symptom — a recycled handle (HUD message,
+  sprite, billboard) is keyed against a slot another consumer
+  has re-purposed this tick.
 
 ## Code style
 
@@ -564,18 +564,18 @@ Approaches we evaluated but didn't ship, with the reason.
     camera_vanilla) · inv(R_vanilla)` instead of P, and apply
     `smoothed_cam + L · R(smoothed)` for both lerp and fallback
     paths. For static screen offsets `L_prev == L_curr`, the
-    lerp output equals the fallback output exactly — the chord-
-    vs-arc divergence disappears, no per-tick alternation reads
-    as flicker.
-- **Plain "leave vanilla position alone" fallback** when the per-
-  ordinal sanity check fails. Intent: if the lerp can't fire,
+    lerp output equals the fallback output exactly — the
+    chord-vs-arc divergence disappears, no per-tick alternation
+    reads as flicker.
+- **Plain "leave vanilla position alone" fallback** when the
+  per-ordinal sanity check fails. Intent: if the lerp can't fire,
   let the engine render the billboard at its vanilla world
   position through the smoothed view — that's the original
   pre-plugin sim-rate behavior, which the user explicitly
   preferred over flicker.
   - Tested. Still read as flicker, not stutter. Through a
-    smoothed view, vanilla curr positions slide by camera per-
-    tick velocity within each inter-tick (camera moves, panel
+    smoothed view, vanilla curr positions slide by camera
+    per-tick velocity within each inter-tick (camera moves, panel
     doesn't). When that alternates per tick with the lerp's
     smooth motion, the alternation is between two distinct
     motions, not between motion and stillness — the eye picks
@@ -592,8 +592,8 @@ Approaches we evaluated but didn't ship, with the reason.
   HUD billboard's raw ordinal shifted by the same amount, and
   the per-ordinal sanity check failed on each shift. The fix:
   compacted ordinal — count only over lerp-eligible billboards
-  (Custom + default ParentID/CVP + no orient), so orient-
-  registered billboards don't shift the HUD's cache index. With
-  this, third-party mods emitting orient-registered content
+  (Custom + default ParentID/CVP + no orient), so
+  orient-registered billboards don't shift the HUD's cache index.
+  With this, third-party mods emitting orient-registered content
   (Build Info, particle systems, etc.) don't perturb the HUD's
   lerp at all.

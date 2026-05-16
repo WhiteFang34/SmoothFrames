@@ -29,9 +29,9 @@ Frames** to bring up a dialog with:
 - **Interpolation enabled** — checkbox, mirror of the Ctrl+F11 hotkey.
   Both sources persist to the same setting.
 - **Frame rate cap** — slider, 60 Hz to your monitor's refresh rate.
-  Rewrites the target frequency on the engine's render-thread frame-
-  rate waiter so the renderer runs up to this many frames per second
-  when the GPU has headroom. Defaults to your monitor's refresh.
+  Rewrites the target frequency on the engine's render-thread
+  frame-rate waiter so the renderer runs up to this many frames per
+  second when the GPU has headroom. Defaults to your monitor's refresh.
 
 Changes apply immediately and persist to
 `%APPDATA%\SpaceEngineers\SmoothFrames.cfg`.
