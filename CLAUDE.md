@@ -367,7 +367,7 @@ inputs captured for re-baking):
 
 ### HUD-framework pool rotation
 
-Rich Hud Master (BV3, Build Vision 3.0) and Text HUD API (HUD
+Rich HUD Master (BV3, Build Vision 3.0) and Text HUD API (HUD
 Compass) emit Custom billboards through `MyTransparentGeometry.
 AddBillboards(IEnumerable, false)` — bulk emission, non-persistent.
 Crucially, both rotate through pre-allocated billboard pools each

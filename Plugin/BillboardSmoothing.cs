@@ -41,7 +41,7 @@ namespace SmoothFrames
 		private static Vector3D _currentSmoothedCameraPos;
 
 		// Vanilla (sim-tick) camera pose at the most recent sim tick — the same
-		// pose mods like Rich Hud Master use to bake their HUD billboards via
+		// pose mods like Rich HUD Master use to bake their HUD billboards via
 		// MyAPIGateway.Session.Camera.WorldMatrix. Read by the camera-anchored
 		// fallback in RebakeOne to compute the per-vertex rebake delta. Set
 		// alongside _currentSmoothedCameraPos at the start of RebakeBeforeGather.
@@ -125,6 +125,24 @@ namespace SmoothFrames
 		private static CachedPositions[] _currPositions = Array.Empty<CachedPositions>();
 		private static int _currCount;
 		private static long _ordinalCacheTickTimestamp;
+
+		// Set on tick advance when `_currCount != _prevCount` — i.e. the
+		// HUD framework's lerp-eligible billboard count grew or shrank
+		// since last tick. When true, TryRebakeOrdinalLerp skips the lerp
+		// branch and uses L_curr only (camera-anchored projection through
+		// the smoothed view). Catches the hover/click case in RHM-based
+		// menus where a highlight box or tooltip appears/disappears,
+		// shifting every downstream ordinal by 1: the position-proximity
+		// gate alone can't discriminate adjacent menu items (typical
+		// item-to-item L distance is mm-scale at PixelToWorld near-plane
+		// scaling, far below any threshold loose enough to allow
+		// legitimate panel motion), so lerping `prev[i]` with `curr[i]`
+		// after such a shift smoothly animates B's content into A's
+		// previous screen position — the "swap chaos" symptom. Balanced
+		// insert+delete (same count, ordinals still shifted) isn't
+		// caught here; it falls through to the existing fingerprint +
+		// L0-distance check below.
+		private static bool _treeRestructured;
 
 		// Position-proximity gate (m²) — companion to the fingerprint check.
 		// Even when prev[i] and curr[i] agree on all fingerprint fields, if
@@ -238,13 +256,24 @@ namespace SmoothFrames
 			var billboards = MyRenderProxy.BillboardsRead;
 			if (billboards != null && billboards.Count > 0)
 			{
-				// Single pass that advances `cacheIdx` only over lerp-eligible
-				// billboards (Custom + default ParentID/CVP + no orient
-				// registered). Orient-registered content (Build Info edge
-				// highlights, face-highlight quads, AddBillboardOriented
-				// users, etc.) doesn't increment cacheIdx — so a third-party
-				// mod's per-tick count changes don't shift the HUD billboards'
-				// ordinals.
+				// Compacted-ordinal lerp: `cacheIdx` advances only over
+				// lerp-eligible billboards (Custom + default ParentID/CVP +
+				// no orient registered). Orient-registered content (Build
+				// Info edge highlights, face-highlight quads,
+				// AddBillboardOriented users, etc.) doesn't increment
+				// cacheIdx — so a third-party mod's per-tick count changes
+				// don't shift the HUD billboards' ordinals.
+				//
+				// Tick advance does capture first, then rebake. The two-pass
+				// shape lets `_currCount` settle before
+				// `TryRebakeOrdinalLerp`'s `ordinal >= _currCount` guard
+				// reads it; a previous single-pass version had the guard
+				// reading the OLD count mid-loop, silently skipping the
+				// rebake for new tail ordinals when the HUD framework grew
+				// its emission count this tick. It also lets us compute
+				// `_treeRestructured` before any lerp fires — required for
+				// the gate to take effect on the same tick the tree
+				// restructure happens, not one tick late.
 				var tickAdvanced = RenderFrameSmoothing.FrameVanillaValid
 					&& RenderFrameSmoothing.FrameVanillaTickTimestamp != _ordinalCacheTickTimestamp;
 
@@ -255,9 +284,38 @@ namespace SmoothFrames
 					_currPositions = swap;
 					_prevCount = _currCount;
 					EnsureOrdinalCapacity(ref _currPositions, billboards.Count);
+
+					var captureIdx = 0;
+					for (var bbIdx = 0; bbIdx < billboards.Count; bbIdx++)
+					{
+						var bb = billboards[bbIdx];
+						if (bb == null
+							|| bb.LocalType != MyBillboard.LocalTypeEnum.Custom)
+						{
+							continue;
+						}
+
+						if (BillboardCapture.TryGetOrient(bb, out _))
+						{
+							continue;
+						}
+
+						if (bb.ParentID != uint.MaxValue
+							|| bb.CustomViewProjection != -1)
+						{
+							continue;
+						}
+
+						CaptureLerpCacheEntry(bb, captureIdx);
+						captureIdx++;
+					}
+
+					_currCount = captureIdx;
+					_ordinalCacheTickTimestamp = RenderFrameSmoothing.FrameVanillaTickTimestamp;
+					_treeRestructured = _currCount != _prevCount;
 				}
 
-				var cacheIdx = 0;
+				var rebakeIdx = 0;
 				for (var bbIdx = 0; bbIdx < billboards.Count; bbIdx++)
 				{
 					var bb = billboards[bbIdx];
@@ -278,19 +336,8 @@ namespace SmoothFrames
 						continue;
 					}
 
-					if (tickAdvanced)
-					{
-						CaptureLerpCacheEntry(bb, cacheIdx);
-					}
-
-					TryRebakeOrdinalLerp(bb, cacheIdx);
-					cacheIdx++;
-				}
-
-				if (tickAdvanced)
-				{
-					_currCount = cacheIdx;
-					_ordinalCacheTickTimestamp = RenderFrameSmoothing.FrameVanillaTickTimestamp;
+					TryRebakeOrdinalLerp(bb, rebakeIdx);
+					rebakeIdx++;
 				}
 			}
 
@@ -471,7 +518,19 @@ namespace SmoothFrames
 
 			Vector3D L0 = curr.L0, L1 = curr.L1, L2 = curr.L2, L3 = curr.L3;
 
-			if (ordinal < _prevCount)
+			// `_treeRestructured` gates the lerp branch when the lerp-
+			// eligible count changed across the last tick advance:
+			// ordinals beyond the insertion/deletion point now reference a
+			// different logical element than they did in `_prevPositions`,
+			// and the fingerprint + distance check below can't catch the
+			// shift when adjacent items share material/blend/CVP and sit
+			// within mm of each other in camera-local L (typical of
+			// closely-packed RHM/BV3 menu lists). Falling back to L_curr
+			// for the whole tick produces a 1-tick snap on legitimately
+			// moving panels but eliminates the swap chaos symptom (B's
+			// content smoothly animating in from A's previous slot when
+			// the UI tree restructures on hover/click).
+			if (!_treeRestructured && ordinal < _prevCount)
 			{
 				var prev = _prevPositions[ordinal];
 				if (prev.MaterialId == curr.MaterialId
