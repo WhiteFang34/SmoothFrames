@@ -12,6 +12,14 @@ namespace SmoothFrames
 	/// </summary>
 	internal struct SmoothedEntity
 	{
+		// MyEntity.EntityId — lets render-thread consumers look up a
+		// specific captured entity by id. PlacementPreviewSmoothing uses
+		// this to find the host grid's smoothed pose when the placement
+		// gizmo is snapped to a grid (the preview entity isn't in the
+		// grid's RenderObjectIDs, so per-entity smoothing doesn't reach
+		// it; we need the grid's pose to compute a delta and apply it to
+		// the preview's separate render entities).
+		public long EntityId;
 		public uint[] RenderObjectIds;
 		public Vector3D PreviousPosition;
 		public Quaternion PreviousRotation;

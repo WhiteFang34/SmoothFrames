@@ -440,25 +440,9 @@ namespace SmoothFrames
 			var entities = curr.SmoothedEntities;
 			if (entities != null && entities.Length > 0)
 			{
-				var alphaF = (float)alpha;
 				for (var i = 0; i < entities.Length; i++)
 				{
-					Vector3D.Lerp(ref entities[i].PreviousPosition, ref entities[i].CurrentPosition,
-						alpha, out var smoothPos);
-
-					var smoothRot = Quaternion.Slerp(entities[i].PreviousRotation, entities[i].CurrentRotation, alphaF);
-
-					// Lerp scale alongside rotation/translation so entities whose
-					// world matrix carries non-identity scale (e.g. the
-					// parachute canopy's billowing animation) recompose
-					// correctly. Reconstructing from rotation + translation
-					// only would produce a rank-deficient matrix and render
-					// the canopy flat.
-					Vector3.Lerp(ref entities[i].PreviousScale, ref entities[i].CurrentScale,
-						alphaF, out var smoothScale);
-
-					MatrixD smoothMatrix = Matrix.CreateScale(smoothScale) * Matrix.CreateFromQuaternion(smoothRot);
-					smoothMatrix.Translation = smoothPos;
+					var smoothMatrix = ComputeSmoothedPose(ref entities[i], alpha);
 
 					if (entities[i].IsGrid && entities[i].CurrentVolume.Radius > 0)
 					{
@@ -487,7 +471,7 @@ namespace SmoothFrames
 				}
 			}
 
-			ApplyPlacementPreviewSmoothing(ref world);
+			ApplyPlacementPreviewSmoothing(ref world, entities, alpha);
 
 			// HUD GPS marker icons / labels: refresh tagged sprite messages
 			// to the smoothed-camera-projected screen position THIS render
@@ -508,6 +492,31 @@ namespace SmoothFrames
 			// this render frame's smoothed pose. Lands BEFORE
 			// RenderMainSprites consumes the queued sprite-ext message.
 			ArtificialHorizonSmoothing.MutateLevelLine();
+		}
+
+		// Reconstruct a captured entity's smoothed pose: lerp position and
+		// scale, slerp rotation against the current alpha, then recompose
+		// into a single MatrixD. Scale is lerped alongside rotation and
+		// translation so entities whose world matrix carries non-identity
+		// scale (e.g. the parachute canopy's billowing animation) recompose
+		// correctly — rotation+translation only would produce a
+		// rank-deficient matrix and render the canopy flat. Used by the
+		// main per-entity smoothing loop (writes the result to each entity's
+		// RenderObjectIds) and by the placement preview's snapped-mode
+		// branch (needs the host grid's smoothed pose without the preview
+		// entity itself being one of the grid's render objects).
+		private static MatrixD ComputeSmoothedPose(ref SmoothedEntity entity, double alpha)
+		{
+			var alphaF = (float)alpha;
+			Vector3D.Lerp(ref entity.PreviousPosition, ref entity.CurrentPosition,
+				alpha, out var smoothPos);
+			var smoothRot = Quaternion.Slerp(entity.PreviousRotation, entity.CurrentRotation, alphaF);
+			Vector3.Lerp(ref entity.PreviousScale, ref entity.CurrentScale,
+				alphaF, out var smoothScale);
+
+			MatrixD smoothMatrix = Matrix.CreateScale(smoothScale) * Matrix.CreateFromQuaternion(smoothRot);
+			smoothMatrix.Translation = smoothPos;
+			return smoothMatrix;
 		}
 
 		// Build the rigid correction matrix that maps a world point at the
@@ -682,16 +691,12 @@ namespace SmoothFrames
 			}
 		}
 
-		// MyCubeBuilder.Draw runs at sim rate (60 Hz) on the update thread,
-		// so the per-entity preview matrices the engine queues each tick are
-		// stale across the multiple render frames between sim ticks. The
-		// captured (renderObjectId, vanillaWorldMatrix) pairs in
-		// PlacementPreviewCapture come from the most recent sim tick paired
-		// with the vanilla camera that produced them; per render frame we
-		// post-multiply each by inverse(vanilla_cam) * smoothed_cam — same
-		// formula as the on-tick prefix would have applied, but driven at
-		// render rate.
-		private static void ApplyPlacementPreviewSmoothing(ref MatrixD smoothedCameraWorld)
+		// Per-render-frame override for the block-placement preview's render
+		// entities. See the class-summary doc on PlacementPreviewCapture for
+		// the two anchoring modes (camera-anchored vs. snapped to a host
+		// grid) and their respective delta formulas.
+		private static void ApplyPlacementPreviewSmoothing(ref MatrixD smoothedCameraWorld,
+			SmoothedEntity[] entities, double alpha)
 		{
 			var snapshot = PlacementPreviewCapture.Read();
 			if (snapshot?.Entries == null || snapshot.Entries.Length == 0)
@@ -699,9 +704,33 @@ namespace SmoothFrames
 				return;
 			}
 
-			var vanillaCameraWorld = snapshot.VanillaCameraWorld;
-			MatrixD.Invert(ref vanillaCameraWorld, out var vanillaInv);
-			var delta = vanillaInv * smoothedCameraWorld;
+			MatrixD delta;
+			if (snapshot.HostGridEntityId == 0)
+			{
+				var vanillaCameraWorld = snapshot.VanillaCameraWorld;
+				MatrixD.Invert(ref vanillaCameraWorld, out var vanillaInv);
+				delta = vanillaInv * smoothedCameraWorld;
+			}
+			else
+			{
+				// Host grid wasn't collected this tick (out of the 5 km
+				// capture radius, or session transition): no smoothed
+				// reference to delta against. Leave the preview at the
+				// sim-tick pose for this frame — looks ghosty (preview at
+				// sim-tick pose against the smoothed scene) but is
+				// harmless and self-corrects the next frame the grid is
+				// captured. In practice placement requires close
+				// proximity so the host is essentially always captured.
+				if (!TryGetSmoothedGridPose(entities, snapshot.HostGridEntityId, alpha,
+					out var gridSmoothed))
+				{
+					return;
+				}
+
+				var hostVanilla = snapshot.HostGridVanillaMatrix;
+				MatrixD.Invert(ref hostVanilla, out var hostVanillaInv);
+				delta = hostVanillaInv * gridSmoothed;
+			}
 
 			var entries = snapshot.Entries;
 			for (var i = 0; i < entries.Length; i++)
@@ -721,6 +750,32 @@ namespace SmoothFrames
 				_savePostponedUpdate(_entityUpdateMessage);
 				_applyPostponedUpdate(id);
 			}
+		}
+
+		// Linear search over the captured entity list, keyed by EntityId.
+		// The list is small (local character + held weapon + piloted grid +
+		// nearby movable grids/characters within 5 km), so the O(n) walk is
+		// cheaper than maintaining a parallel dictionary that has to be
+		// rebuilt each tick.
+		private static bool TryGetSmoothedGridPose(SmoothedEntity[] entities, long entityId,
+			double alpha, out MatrixD smoothed)
+		{
+			smoothed = default;
+			if (entities == null)
+			{
+				return false;
+			}
+
+			for (var i = 0; i < entities.Length; i++)
+			{
+				if (entities[i].EntityId == entityId)
+				{
+					smoothed = ComputeSmoothedPose(ref entities[i], alpha);
+					return true;
+				}
+			}
+
+			return false;
 		}
 	}
 }

@@ -498,6 +498,7 @@ namespace SmoothFrames
 
 				_scratchEntities.Add(new SmoothedEntity
 				{
+					EntityId = entity.EntityId,
 					RenderObjectIds = hasAnyValidId ? ids : Array.Empty<uint>(),
 					PreviousPosition = prevMatrix.Translation,
 					PreviousRotation = prevRot,

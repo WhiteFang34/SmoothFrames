@@ -4,6 +4,7 @@ using System.Reflection;
 using HarmonyLib;
 using Sandbox.Game.Entities;
 using VRage.Game;
+using VRage.Game.Entity;
 using VRageMath;
 
 namespace SmoothFrames
@@ -22,7 +23,7 @@ namespace SmoothFrames
 	///     once per sim tick, after which the renderer reuses that same
 	///     matrix for every interpolated render frame in between — the
 	///     preview snaps to sim-tick poses while the rest of the scene moves
-	///     smoothly, which is the visible ghosting in free-floating mode.
+	///     smoothly, which is the visible ghosting.
 	///
 	///     Instead we mirror the held-tool pattern: capture each preview
 	///     render entity's vanilla world matrix on the sim thread (postfix
@@ -31,16 +32,32 @@ namespace SmoothFrames
 	///     calls per entity inside EndCollectingInstanceData), then on the
 	///     render thread per render frame in
 	///     <see cref="RenderFrameSmoothing.RunFrame"/> reapply each captured
-	///     matrix post-multiplied by inverse(vanilla_cam) * smoothed_cam,
-	///     pushed synchronously through the PostponedUpdate bypass after the
-	///     message queue has drained. The smoothed camera is recomputed fresh
-	///     each render frame so the preview tracks the camera sub-tick.
+	///     matrix post-multiplied by a per-frame delta, pushed synchronously
+	///     through the PostponedUpdate bypass after the message queue has
+	///     drained.
 	///
-	///     Scoped to free-floating placement (<c>CurrentGrid == null</c>).
-	///     Snapped placement is skipped: the grid is independent of the
-	///     camera (on foot) or already smoothed via the entity path
-	///     (piloting), so applying the camera delta would shift the gizmo
-	///     off the grid face.
+	///     Two anchoring modes, discriminated by <see cref="Snapshot.HostGridEntityId"/>:
+	///
+	///     - <b>Camera-anchored</b> (CurrentGrid == null, free-floating; or
+	///       DynamicMode == true regardless of CurrentGrid — see the
+	///       <c>(CurrentGrid == null || DynamicMode)</c> branch in
+	///       <see cref="MyCubeBuilder"/>'s Draw): the gizmo follows the
+	///       camera, so delta = inv(vanilla_cam) * smoothed_cam. Same
+	///       formula a hypothetical on-tick prefix would apply, just driven
+	///       per render frame against the freshly-interpolated camera.
+	///
+	///     - <b>Snapped to a grid</b> (CurrentGrid != null, !DynamicMode):
+	///       the gizmo follows the host grid's WorldMatrix, so
+	///       delta = inv(grid_vanilla) * grid_smoothed. The host grid's
+	///       smoothed pose is reconstructed on the render thread by looking
+	///       it up in CameraSnapshot.SmoothedEntities by EntityId and
+	///       applying the same lerp/slerp the entity loop uses. Without
+	///       this branch a small grid block being placed on a large grid
+	///       ghosts: the preview entity isn't in the host grid's
+	///       RenderObjectIDs (so the per-entity smoothing path never
+	///       touches it), the gizmo's matrix moves at sim rate on the
+	///       update thread, and the renderer reuses that stale matrix
+	///       across every interpolated render frame in between.
 	/// </summary>
 	internal static class PlacementPreviewCapture
 	{
@@ -60,6 +77,22 @@ namespace SmoothFrames
 		internal sealed class Snapshot
 		{
 			public MatrixD VanillaCameraWorld;
+
+			// 0 = camera-anchored (free-floating or dynamic mode); use
+			// VanillaCameraWorld as the delta basis. Non-zero = snapped;
+			// look this EntityId up in SmoothedEntities to derive the
+			// grid's smoothed pose, and use HostGridVanillaMatrix as the
+			// vanilla side of the delta.
+			public long HostGridEntityId;
+
+			// The gridWorldMatrix parameter passed to
+			// EndCollectingInstanceData at this sim tick — equals
+			// CurrentGrid.WorldMatrix in snapped mode. Render thread
+			// computes delta = inv(this) * grid_smoothed and post-multiplies
+			// each entry's VanillaWorldMatrix by it. Unused when
+			// HostGridEntityId is 0.
+			public MatrixD HostGridVanillaMatrix;
+
 			public Entry[] Entries;
 		}
 
@@ -103,7 +136,7 @@ namespace SmoothFrames
 			_scratch.Add(new Entry { RenderEntityId = id, VanillaWorldMatrix = world });
 		}
 
-		public static void Commit(MatrixD vanillaCameraWorld)
+		public static void Commit(MatrixD vanillaCameraWorld, long hostGridEntityId, MatrixD hostGridVanillaMatrix)
 		{
 			if (_scratch.Count == 0)
 			{
@@ -113,6 +146,8 @@ namespace SmoothFrames
 			_published = new Snapshot
 			{
 				VanillaCameraWorld = vanillaCameraWorld,
+				HostGridEntityId = hostGridEntityId,
+				HostGridVanillaMatrix = hostGridVanillaMatrix,
 				Entries = _scratch.ToArray()
 			};
 		}
@@ -121,11 +156,11 @@ namespace SmoothFrames
 	/// <summary>
 	///     Sim-thread bracket on
 	///     <c>MyBlockBuilderRenderData.EndCollectingInstanceData</c>. Prefix
-	///     clears the scratch list and decides whether this tick's per-entity
-	///     pushes should be captured (only when the gizmo is camera-anchored
-	///     in free-floating mode). Postfix commits the captured list as the
-	///     new render-thread snapshot, paired with the vanilla camera world
-	///     matrix at this tick.
+	///     clears the scratch list, enables capture, and records the
+	///     anchoring mode (camera-anchored vs. snapped to a host grid).
+	///     Postfix commits the captured list as the new render-thread
+	///     snapshot, paired with the vanilla camera world matrix and the
+	///     gridWorldMatrix parameter at this tick.
 	/// </summary>
 	[HarmonyPatch]
 	public static class PatchEndCollectingInstanceData
@@ -134,6 +169,11 @@ namespace SmoothFrames
 		private static readonly PropertyInfo _currentGridProp =
 			AccessTools.Property(typeof(MyCubeBuilder), "CurrentGrid")
 			?? throw Errors.NotResolved("MyCubeBuilder.CurrentGrid");
+
+		// Set in Prefix, read in Postfix — same sim-thread call, no
+		// synchronization needed. Cleared back to 0 at Prefix entry so a
+		// previous tick's value can't leak in if something goes wrong.
+		private static long _pendingHostGridEntityId;
 
 		public static MethodBase TargetMethod()
 		{
@@ -146,6 +186,7 @@ namespace SmoothFrames
 		{
 			PlacementPreviewCapture.BeginTick();
 			PlacementPreviewCapture.ShouldCapture = false;
+			_pendingHostGridEntityId = 0;
 
 			var cubeBuilder = MyCubeBuilder.Static;
 			if (cubeBuilder == null)
@@ -153,41 +194,58 @@ namespace SmoothFrames
 				return;
 			}
 
-			// Free-floating placement: CurrentGrid == null. Gizmo is
-			// camera-anchored, so the camera delta is the right correction.
-			// Snapped placement is skipped — the grid is independent of the
-			// camera (on foot) or already smoothed via the entity path
-			// (piloting, not yet observed to ghost in this case).
-			var currentGrid = _currentGridProp.GetValue(cubeBuilder);
-			if (currentGrid != null)
-			{
-				return;
-			}
-
 			PlacementPreviewCapture.ShouldCapture = true;
+
+			// MyCubeBuilder.Draw branches on (CurrentGrid == null ||
+			// DynamicMode): the gizmo uses
+			// m_gizmo.SpaceDefault.m_worldMatrixAdd (camera-anchored) in
+			// those cases, and CurrentGrid.WorldMatrix only in the snapped
+			// branch. Mirror the same condition: HostGridEntityId is
+			// non-zero only when we're going to be passed the host grid's
+			// WorldMatrix, so the render thread can compute
+			// delta = inv(grid_vanilla) * grid_smoothed against the right
+			// matrix.
+			if (_currentGridProp.GetValue(cubeBuilder) is MyEntity currentGrid && !cubeBuilder.DynamicMode)
+			{
+				_pendingHostGridEntityId = currentGrid.EntityId;
+			}
 		}
 
-		public static void Postfix()
+		public static void Postfix(MatrixD gridWorldMatrix)
 		{
 			// MyTransparentGeometry.Camera = MySector.MainCamera.WorldMatrix;
 			// at this point in the sim tick it holds the sim-tick T camera
-			// the gizmo matrix was derived from upstream of this call. Pair it
-			// with the captured matrices so the render thread takes its delta
-			// against the right vanilla pose, even if a new sim tick has
-			// overwritten MyTransparentGeometry.Camera by the time the render
-			// thread reads.
-			PlacementPreviewCapture.Commit(MyTransparentGeometry.Camera);
+			// the gizmo matrix was derived from upstream of this call. Pair
+			// it with the captured matrices so the render thread takes its
+			// delta against the right vanilla pose, even if a new sim tick
+			// has overwritten MyTransparentGeometry.Camera by the time the
+			// render thread reads.
+			//
+			// gridWorldMatrix is the engine's actual per-entity multiplier
+			// for this call — equals CurrentGrid.WorldMatrix in snapped
+			// mode, equals the gizmo's camera-derived matrix otherwise.
+			// Captured directly from the parameter (not re-read from
+			// CurrentGrid) so DynamicMode-on-grid and other edge cases
+			// produce a matching vanilla side for the delta.
+			PlacementPreviewCapture.Commit(MyTransparentGeometry.Camera,
+				_pendingHostGridEntityId, gridWorldMatrix);
 
 			// HasEntries is the load-bearing signal: if the engine produced
-			// preview render entities this tick AND we were in free-floating
-			// mode (the prefix's CurrentGrid == null gate), the gizmo's
+			// preview render entities this tick AND we were in
+			// camera-anchored mode (HostGridEntityId == 0), the gizmo's
 			// green/red wireframe is also in flight as line billboards and
 			// needs the same camera-delta treatment.
 			// BillboardSmoothing.RebakeLine reads the flag on the render
-			// thread to opt into the camera-anchored long-span path.
-			BillboardSmoothing.SetFreeFloatingPlacement(PlacementPreviewCapture.HasEntries);
+			// thread to opt into the camera-anchored long-span path. In
+			// snapped mode the wireframe is anchored to the host grid and
+			// follows it via BillboardCorrections' moving-grid path (the
+			// per-grid sphere registered by RegisterGridForBillboardRebake).
+			var cameraAnchored = _pendingHostGridEntityId == 0;
+			BillboardSmoothing.SetFreeFloatingPlacement(
+				cameraAnchored && PlacementPreviewCapture.HasEntries);
 
 			PlacementPreviewCapture.ShouldCapture = false;
+			_pendingHostGridEntityId = 0;
 		}
 	}
 
