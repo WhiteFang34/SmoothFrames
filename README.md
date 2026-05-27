@@ -2,7 +2,7 @@
 
 A Space Engineers plugin that smooths motion to your monitor's
 refresh rate. Vanilla SE updates the world 60 times per second, so
-even on a 144 Hz or 240 Hz monitor, motion looks like 60 FPS — each
+even on a 144 Hz, 240 Hz, or 360 Hz monitor, motion looks like 60 FPS — each
 render frame is a copy of the last sim tick until the next one lands.
 Smooth Frames interpolates the camera and nearby entities between
 sim ticks, so every render frame shows a distinct moment of motion.
