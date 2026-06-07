@@ -383,7 +383,23 @@ they're omitted).
   (the same lookup `MyRender11.ProcessMessageQueue` uses internally
   to dispatch every per-id message). Used by
   `ApplyAttachedLightSmoothing` to locate the actor of an
-  unparented light without going through the queue.
+  unparented light without going through the queue, and by
+  `BillboardSmoothing.IsEffectivelyUnparented` to resolve a
+  billboard's `ParentID` the same way `MyBillboardRenderer.Gather`
+  does (below).
+- `MyBillboardRenderer.Gather` — a Custom billboard's corners are
+  transformed by its parent actor's `WorldMatrix` **only when**
+  `myBillboard.ParentID != uint.MaxValue` **and**
+  `MyIDTracker<MyActor>.FindByID(ParentID) != null`. So
+  `uint.MaxValue` (`MyRenderProxy.RENDER_ID_UNASSIGNED`) is *not* the
+  only "render verbatim in world space" case — a non-`uint.MaxValue`
+  id that doesn't resolve to a live actor renders verbatim too.
+  Bulk HUD emitters lean on this: WeaponCore's combat UI passes
+  `parentID 0` to `AddTriangleBillboard`, `0` never resolves, and the
+  glyphs render at world coords exactly like `uint.MaxValue`. Our
+  eligibility filter must mirror this (`ParentID != uint.MaxValue` by
+  itself does **not** mean "parented") or such content is excluded
+  from smoothing and slides through the smoothed view.
 - `MyActor.SetMatrix(ref MatrixD)` — public; writes the actor's
   world matrix and dirties the cull tree. For an unparented light
   this is exactly what `MyLightComponent.UpdateData` ends up doing
@@ -552,6 +568,46 @@ Consequences for re-baking:
   formula across the lerp and fallback paths, so they don't
   diverge under fast rotation (which is what world-position lerp
   did — see "Considered and rejected").
+
+**WeaponCore is a different kind of bulk emitter** and needs
+different handling (issue #1: "HUD text ghosting"). It re-lays its
+*entire* combat HUD draw list from pooled objects every sim tick
+(`Hud.DrawTextures`/`DrawText`), emitting each text glyph and UV
+texture as two `MyTransparentGeometry.AddTriangleBillboard` calls —
+and passing **`parentID 0`**, not `uint.MaxValue`. Two consequences:
+
+- **It was excluded from smoothing entirely**, not mis-lerped. The
+  `ParentID != uint.MaxValue` eligibility check skipped it, so it
+  rendered at its vanilla sim-tick world coords through our smoothed
+  view and slid every frame — radially about screen center under
+  rotation (the smoothed camera is rotated slightly less than
+  vanilla, pivoting each HUD point about the forward axis by an
+  amount ∝ its distance from center — the reporter's "letters
+  animate into position from the center"). This is the
+  "leave-vanilla-alone → slide" artifact from "Considered and
+  rejected", leaking in through the `ParentID` gate. The fix is
+  `IsEffectivelyUnparented` resolving `parentID 0` as world-space
+  (see the `MyBillboardRenderer.Gather` engine note above).
+- **It can't use the per-ordinal lerp.** Per-ordinal caching needs a
+  stable emission order; WeaponCore rebuilds its glyph stream from
+  content each tick (weapon status strings, target re-sorts, aging
+  distance labels, reload-icon frames), so ordinal i rarely holds the
+  same logical glyph two ticks running. And the two guards that catch
+  ordinal shifts elsewhere both fail here: every glyph of a font
+  shares **one** atlas material (`EnglishFontMono`/`EnglishFontShadow`,
+  differing only by UV), so the material fingerprint can't tell glyphs
+  apart; and the whole HUD spans only a few cm in camera-local L at
+  the ~0.1 m near plane, far inside the 0.5 m `OrdinalLerpMaxDistSq`
+  gate. So dangling-parent content is routed to the camera-anchored
+  `L_curr` reprojection (`TryRebakeCameraAnchoredFallback`) instead —
+  frame-exact, order-independent, screen-locked. It takes no ordinal
+  slot, so it can't perturb the RHM/Text-HUD-API lerp either.
+
+WeaponCore's *non-text* HUD (reticle, icons via `AddBillboardOriented`)
+is unaffected: that path runs through `CreateBillboard`, which sets
+`ParentID = uint.MaxValue`, so it was already smoothed by the
+Direct-orient path (`RebakeDirect`). Only the `AddTriangleBillboard`
+(`parentID 0`) text and UV quads needed the fix.
 
 ### Light pipeline
 

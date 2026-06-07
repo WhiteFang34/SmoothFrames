@@ -3,6 +3,7 @@ using System.Reflection;
 using System.Runtime.CompilerServices;
 using HarmonyLib;
 using VRage.Game;
+using VRage.Render.Scene;
 using VRage.Utils;
 using VRageMath;
 using VRageRender;
@@ -360,8 +361,25 @@ namespace SmoothFrames
 						continue;
 					}
 
-					if (bb.ParentID != uint.MaxValue
-						|| bb.CustomViewProjection != -1)
+					// CustomViewProjection != -1 projects through a separate
+					// camera (BillboardsViewProjectionRead), not our smoothed
+					// view — leave it alone.
+					if (bb.CustomViewProjection != -1)
+					{
+						continue;
+					}
+
+					// Skip genuinely-parented billboards: the renderer
+					// transforms their corners by the parent actor's world
+					// matrix and the parent-following machinery keeps them
+					// aligned, so a world-space override would fight it. A
+					// non-uint.MaxValue ParentID that DOESN'T resolve to a live
+					// actor is the renderer's "render verbatim in world space"
+					// case (WeaponCore's combat HUD passes a sentinel 0) — it's
+					// effectively unparented and, left unsmoothed, slides
+					// radially about screen center through our smoothed view. See
+					// IsEffectivelyUnparented.
+					if (!IsEffectivelyUnparented(bb))
 					{
 						continue;
 					}
@@ -376,6 +394,25 @@ namespace SmoothFrames
 					if (IsRecoverableOverlayQuad(bb))
 					{
 						ApplyDepthPulledOverlayRecovery(bb);
+						continue;
+					}
+
+					// uint.MaxValue HUD (Rich HUD Master, Text HUD API) keeps a
+					// stable emission order across its pool rotation, so the
+					// per-ordinal lerp pairs each billboard with its own prior
+					// pose and smooths sim-rate motion. A dangling ParentID
+					// instead marks a fire-and-forget bulk emitter whose stream
+					// is rebuilt from content every tick (WeaponCore re-lays its
+					// whole glyph list each tick) — there's no stable ordinal
+					// identity to lerp against, so pairing by ordinal would mix
+					// unrelated glyphs. Reproject it camera-anchored against
+					// L_curr instead (frame-exact, order-independent). It never
+					// took an ordinal slot — the capture loop above skips
+					// non-uint.MaxValue — so it can't perturb the lerp
+					// population either.
+					if (bb.ParentID != uint.MaxValue)
+					{
+						TryRebakeCameraAnchoredFallback(bb);
 						continue;
 					}
 
@@ -612,14 +649,22 @@ namespace SmoothFrames
 		// vertex formula as RebakeDirect, but driven from the per-frame
 		// vanilla camera pose (no per-billboard orient capture needed). Quad
 		// vs. triangle billboards are discriminated by runtime type —
-		// MyTriangleBillboard only uses Position0..2 and leaves Position3 at
-		// its allocation default, so writing it would produce a stale corner
-		// the renderer happens to ignore for the triangle path but would
-		// skew the proximity gate.
+		// MyTriangleBillboard's render path uses only Position0..2 (the engine
+		// sets Position3 to a copy of Position0, which it then ignores), so we
+		// leave Position3 alone; transforming it would skew the proximity gate
+		// for no benefit.
+		//
+		// Two callers: the persistent-billboard path (RebakeOne) and the
+		// BillboardsRead loop's dangling-parent branch (WeaponCore-style bulk
+		// HUD). The per-ref _fallbackOriginals cache is only relied on for
+		// within-tick stability — the destructive transform must read the same
+		// vanilla pose across every render frame of a tick — and it re-captures
+		// on tick advance, so it's correct for pool-cycled non-persistent refs
+		// too (this path never reads a prior tick's entry; only the lerp does).
 		private static void TryRebakeCameraAnchoredFallback(MyBillboard billboard)
 		{
 			if (!_currentDeltaValid
-				|| billboard.ParentID != uint.MaxValue
+				|| !IsEffectivelyUnparented(billboard)
 				|| billboard.CustomViewProjection != -1)
 			{
 				return;
@@ -701,6 +746,12 @@ namespace SmoothFrames
 		// refs every frame of a tick.
 		private static void TryRebakePointDepthPulled(MyBillboard billboard)
 		{
+			// Deliberately stricter than the Custom path's IsEffectivelyUnparented:
+			// AddPointBillboard with a non-uint.MaxValue parent transforms
+			// Position0 into the parent's local frame, so a dangling-parent Point
+			// holds local coords the depth-pull translation must not touch. Keep
+			// the literal uint.MaxValue test — don't "unify" it with the Custom
+			// resolver. /bi cn dots use the uint.MaxValue overload, so they pass.
 			if (!_currentDeltaValid
 				|| billboard.ParentID != uint.MaxValue
 				|| billboard.CustomViewProjection != -1)
@@ -729,6 +780,24 @@ namespace SmoothFrames
 
 			billboard.Position0 = orig.P0
 				+ (_currentSmoothedCameraPos - _currentVanillaCameraPos) * DepthPulledOverlay.Complement;
+		}
+
+		// Mirrors the renderer's parent resolution (MyBillboardRenderer.Gather):
+		// a billboard's ParentID is a real parent only when it resolves to a
+		// live MyActor, whose world matrix the renderer multiplies the corners
+		// by. uint.MaxValue is the documented "no parent" sentinel
+		// (MyRenderProxy.RENDER_ID_UNASSIGNED); a non-resolving id is equally
+		// unparented — the renderer leaves such corners in world space. Bulk HUD
+		// emitters rely on this: WeaponCore's combat UI passes ParentID 0, which
+		// never resolves, so its glyphs render at world coords and (unsmoothed)
+		// slide through our smoothed view. Treat both as world-space content to
+		// smooth; a genuine parent we leave to its parent-following machinery.
+		// FindByID is a render-thread dictionary lookup, reached only for the
+		// rare non-uint.MaxValue id (uint.MaxValue short-circuits).
+		private static bool IsEffectivelyUnparented(MyBillboard billboard)
+		{
+			return billboard.ParentID == uint.MaxValue
+				|| MyIDTracker<MyActor>.FindByID(billboard.ParentID) == null;
 		}
 
 		// Binds the current frame's vanilla camera pose + near-camera threshold
