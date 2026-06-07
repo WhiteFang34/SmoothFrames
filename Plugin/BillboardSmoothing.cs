@@ -18,9 +18,14 @@ namespace SmoothFrames
 	///     the smoothed scene during fast movement.
 	///
 	///     <see cref="MyBillboard.LocalTypeEnum.Line"/> and
-	///     <see cref="MyBillboard.LocalTypeEnum.Point"/> already use the
-	///     smoothed camera at render-time vertex generation, so they aren't
-	///     touched here.
+	///     <see cref="MyBillboard.LocalTypeEnum.Point"/> generate their quad
+	///     against the smoothed camera at render-time, so a billboard whose
+	///     stored center/endpoints are true world coords smooths for free. The
+	///     exception is depth-pulled content (a camera-relative position baked
+	///     at sim rate), re-anchored by <see cref="TryRebakePointDepthPulled"/>
+	///     for dots and <see cref="ApplyDepthPulledOverlayRecovery"/> for
+	///     overlay quads — see <see cref="DepthPulledOverlay"/> for how that
+	///     content is recognized and why it needs correcting.
 	///
 	///     Sim-side capture lives in <see cref="BillboardCapture"/>; per-frame
 	///     moving-grid corrections live in
@@ -306,6 +311,15 @@ namespace SmoothFrames
 							continue;
 						}
 
+						// Depth-pulled Build Info overlay quads are rebaked out of band
+						// (ApplyDepthPulledOverlayRecovery), so they don't take an
+						// ordinal slot — same classification the rebake loop
+						// applies, keeping captureIdx and rebakeIdx aligned.
+						if (IsRecoverableOverlayQuad(bb))
+						{
+							continue;
+						}
+
 						CaptureLerpCacheEntry(bb, captureIdx);
 						captureIdx++;
 					}
@@ -319,8 +333,24 @@ namespace SmoothFrames
 				for (var bbIdx = 0; bbIdx < billboards.Count; bbIdx++)
 				{
 					var bb = billboards[bbIdx];
-					if (bb == null
-						|| bb.LocalType != MyBillboard.LocalTypeEnum.Custom)
+					if (bb == null)
+					{
+						continue;
+					}
+
+					// Depth-pulled Point billboards (Build Info's /bi cn
+					// conveyor dots) carry a camera-relative center the engine
+					// leaves frozen per sim tick. Handled out of band from the
+					// Custom ordinal cache — they don't take a compacted ordinal
+					// (the capture loop above skips non-Custom too), so a /bi cn
+					// toggle never shifts the HUD lerp's ordinals.
+					if (bb.LocalType == MyBillboard.LocalTypeEnum.Point)
+					{
+						TryRebakePointDepthPulled(bb);
+						continue;
+					}
+
+					if (bb.LocalType != MyBillboard.LocalTypeEnum.Custom)
 					{
 						continue;
 					}
@@ -333,6 +363,19 @@ namespace SmoothFrames
 					if (bb.ParentID != uint.MaxValue
 						|| bb.CustomViewProjection != -1)
 					{
+						continue;
+					}
+
+					// Depth-pulled conveyor lines (/bi cn) get frame-exact
+					// depth-recovery instead of the HUD ordinal-lerp, so Build
+					// Info's per-tick re-sort/cull churn can't flicker them. The
+					// skip decision is the same predicate the capture loop uses
+					// (independent of _currentDeltaValid), so captureIdx and
+					// rebakeIdx stay aligned even on a frame where the delta is
+					// momentarily invalid; the recovery itself no-ops then.
+					if (IsRecoverableOverlayQuad(bb))
+					{
+						ApplyDepthPulledOverlayRecovery(bb);
 						continue;
 					}
 
@@ -639,14 +682,141 @@ namespace SmoothFrames
 			}
 		}
 
+		// Re-anchors a depth-pulled Point billboard's center to the smoothed-
+		// camera frame each render frame — e.g. the dots side of Build Info's
+		// /bi cn overlay, though this path keys on no mod data. See
+		// DepthPulledOverlay for the depth-pull technique; the camera-relative
+		// transform a HUD quad takes would stutter here (the engine renders a
+		// Point relative to the smoothed camera, cancelling the rotation).
+		//
+		// Mechanism: rewrite Position0 to vanillaCenter + (smoothedCam −
+		// vanillaCam) × 0.99 (the depth-pull recovery, collapsed to a
+		// translation). Caught geometrically — any near-camera unparented Point
+		// — so it stays mod-agnostic. Only Position0 is written; Position2
+		// carries radius/angle, read as-is. The near-camera gate also leaves
+		// genuinely world-anchored Point billboards (distant GPS pins, particle
+		// points) alone. The per-tick original-center cache (_fallbackOriginals)
+		// keeps the rebake reading the vanilla center rather than compounding
+		// across the render frames of a tick — BillboardsRead holds the same
+		// refs every frame of a tick.
+		private static void TryRebakePointDepthPulled(MyBillboard billboard)
+		{
+			if (!_currentDeltaValid
+				|| billboard.ParentID != uint.MaxValue
+				|| billboard.CustomViewProjection != -1)
+			{
+				return;
+			}
+
+			var hasOrig = _fallbackOriginals.TryGetValue(billboard, out var orig);
+			if (!hasOrig || orig.TickTimestamp != RenderFrameSmoothing.FrameVanillaTickTimestamp)
+			{
+				var center = billboard.Position0;
+				if (Vector3D.DistanceSquared(center, _currentVanillaCameraPos) > CameraAnchoredThresholdSq)
+				{
+					return;
+				}
+
+				if (!hasOrig)
+				{
+					orig = new FallbackOriginal();
+					_fallbackOriginals.Add(billboard, orig);
+				}
+
+				orig.P0 = center;
+				orig.TickTimestamp = RenderFrameSmoothing.FrameVanillaTickTimestamp;
+			}
+
+			billboard.Position0 = orig.P0
+				+ (_currentSmoothedCameraPos - _currentVanillaCameraPos) * DepthPulledOverlay.Complement;
+		}
+
+		// Binds the current frame's vanilla camera pose + near-camera threshold
+		// to the mod-agnostic recognizer in DepthPulledOverlay, so the smoothing
+		// engine itself holds no mod-specific material data. Both loops call
+		// this to decide the ordinal split.
+		private static bool IsRecoverableOverlayQuad(MyBillboard billboard)
+		{
+			return DepthPulledOverlay.IsDepthPulledOverlayQuad(
+				billboard, _currentVanillaCameraPos, CameraAnchoredThresholdSq);
+		}
+
+		// Re-anchors a depth-pulled overlay quad (e.g. a Build Info conveyor
+		// line, arrow, or box) to the smoothed-camera frame by translating every
+		// corner by (smoothedCam − vanillaCam) × 0.99. See DepthPulledOverlay for
+		// why material detection (not geometry) routes it here and why it would
+		// otherwise flicker on the HUD ordinal-lerp; BuildInfoOverlay for the
+		// specific Build Info content. The baked camera-facing perp is left as-is
+		// — negligible for a sub-mm-thick line ~3 m out.
+		//
+		// Caller (both loops) has already classified via
+		// DepthPulledOverlay.IsDepthPulledOverlayQuad and committed to skipping
+		// the ordinal slot; this just applies the recovery, a no-op when the
+		// delta is invalid (alignment already preserved). The shared per-tick
+		// original-corner cache (_fallbackOriginals) keeps the translation
+		// reading vanilla corners instead of compounding across a tick's frames.
+		private static void ApplyDepthPulledOverlayRecovery(MyBillboard billboard)
+		{
+			if (!_currentDeltaValid)
+			{
+				return;
+			}
+
+			var hasOrig = _fallbackOriginals.TryGetValue(billboard, out var orig);
+			if (!hasOrig || orig.TickTimestamp != RenderFrameSmoothing.FrameVanillaTickTimestamp)
+			{
+				if (!hasOrig)
+				{
+					orig = new FallbackOriginal();
+					_fallbackOriginals.Add(billboard, orig);
+				}
+
+				orig.P0 = billboard.Position0;
+				orig.P1 = billboard.Position1;
+				orig.P2 = billboard.Position2;
+				orig.P3 = billboard.Position3;
+				orig.IsTriangle = false;
+				orig.TickTimestamp = RenderFrameSmoothing.FrameVanillaTickTimestamp;
+			}
+
+			var delta = (_currentSmoothedCameraPos - _currentVanillaCameraPos) * DepthPulledOverlay.Complement;
+			billboard.Position0 = orig.P0 + delta;
+			billboard.Position1 = orig.P1 + delta;
+			billboard.Position2 = orig.P2 + delta;
+			billboard.Position3 = orig.P3 + delta;
+		}
+
+		// Max captured radius for the depth-pulled-point recovery below. Build
+		// Info's see-through point overlays are emitted at ~1% scale (the ×0.01
+		// depth-pull also scales the radius), so the always-on-top copy is
+		// sub-cm while the solid world-anchored copy at the same point keeps the
+		// full radius. Gating on a tiny radius keeps a nearby solid marker from
+		// being dragged by the recovery.
+		private const float DepthPulledPointMaxRadius = 0.02f;
+
 		private static void RebakeAxisAligned(MyBillboard billboard, BillboardOrient orient, Vector3D smoothedCameraPos)
 		{
-			// Re-anchor against the smoothed grid pose if origin lies on a
-			// moving grid (e.g. Build Info CoM marker on a coasting ship).
-			// Without this the point quad sits at the grid's vanilla world
-			// position while the grid's mesh renders at its smoothed pose.
 			var origin = orient.Origin;
-			if (BillboardCorrections.TryFindCorrection(origin, out var movingGridCorrection))
+
+			// Build Info's "see-through walls" point overlays (e.g. the Measure
+			// tool's vertex markers) emit an always-on-top copy depth-pulled
+			// ×0.01 toward the vanilla camera (ConvertToAlwaysOnTop) — its center
+			// is camera-relative and frozen per sim tick, so re-facing it at that
+			// frozen center ghosts/stutters exactly like the conveyor dots.
+			// Recover it with the same depth-pull translation. Gated on a tiny
+			// radius AND near-camera so it catches the ~1%-scale see-through copy
+			// and not the full-size solid copy that may sit equally close.
+			if (_currentDeltaValid
+				&& orient.SizeX < DepthPulledPointMaxRadius
+				&& Vector3D.DistanceSquared(origin, _currentVanillaCameraPos) <= CameraAnchoredThresholdSq)
+			{
+				origin += (_currentSmoothedCameraPos - _currentVanillaCameraPos) * DepthPulledOverlay.Complement;
+			}
+			// Otherwise re-anchor against the smoothed grid pose if the origin
+			// lies on a moving grid (e.g. Build Info CoM marker on a coasting
+			// ship). Without this the point quad sits at the grid's vanilla world
+			// position while the grid's mesh renders at its smoothed pose.
+			else if (BillboardCorrections.TryFindCorrection(origin, out var movingGridCorrection))
 			{
 				Vector3D.Transform(ref origin, ref movingGridCorrection, out var corrected);
 				origin = corrected;
@@ -698,18 +868,16 @@ namespace SmoothFrames
 			return smoothedCameraPos + rotatedOffset;
 		}
 
-		// Build Info's overlay system pulls "see-through-walls" line endpoints
-		// toward the camera by ~1% (a depth-test trick that draws them in
-		// front of geometry), giving them a tiny world-space span. Solid
-		// edges retain the actual block size (~1 m). Discriminating by span²
-		// (rather than distance-from-camera, which fails when you select the
-		// cockpit you're sitting in) cleanly splits the two cases on foot,
-		// where camera-pulled lines need a translation correction the vanilla
-		// rebake doesn't handle.
-		private const double CameraPulledSpanSq = 0.1 * 0.1;
-		private const double DepthPullScale = 0.01;
-		private const double DepthPullInverseScale = 1.0 / DepthPullScale;
-		private const double DepthPullComplement = 1.0 - DepthPullScale;
+		// Build Info's "see-through-walls" overlay lines are depth-pulled ×0.01
+		// toward the camera, so they're THIN (≤~1 mm thickness) and sit within
+		// metres of the camera regardless of the underlying feature's real
+		// length. Solid lines keep full thickness (≥~cm) even when near (a
+		// cockpit edge you're sitting in). So thickness + near-camera is the
+		// reliable depth-pull discriminator — distinguishing it from span, which
+		// scales with the feature's length and so misread a long measurement's
+		// see-through copy (0.01× a 10 m+ span) as "solid" and left it frozen at
+		// the depth-pulled pose (stutter, with a boundary flip → flicker).
+		private const float DepthPulledLineMaxThickness = 0.003f;
 
 		private static void RebakeLine(MyBillboard billboard, BillboardOrient orient, Vector3D smoothedCameraPos)
 		{
@@ -745,19 +913,41 @@ namespace SmoothFrames
 				return;
 			}
 
-			// On foot: solid lines (long span) are anchored to a static world
-			// position; the engine's vanilla quad through our smoothed view
-			// matrix renders at the same screen position as the underlying
-			// mesh, so we leave them alone. Camera-pulled lines (short span —
-			// Build Info's depth-pulled overlay box) sit at camPos + (target
+			// Build Info's "Short Range LIDAR" preview frustum draws a
+			// camera-anchored viewfinder square at its near plane. The lines are
+			// thin (0.001) and ~0.1 m from the camera, so the thickness +
+			// near-camera classifier below would misread them as depth-pulled
+			// see-through lines and translate them by (smoothed − vanilla) × 0.99
+			// with no rotation — leaving the square frozen at the sim-tick
+			// orientation while the view rotates (the stutter). It's genuinely
+			// camera-anchored, so route it to the full camera-relative transform.
+			// Recognized by near-plane corner geometry (material and thickness
+			// collide with the Measure tool's see-through lines) — see
+			// DepthPulledOverlay (general dispatch) / BuildInfoOverlay (constants).
+			// Far endpoint, reused by the viewfinder test and the depth-pull
+			// recovery further down.
+			var endpoint = orient.Origin + (Vector3D)orient.Direction * orient.Length;
+			if (DepthPulledOverlay.IsCameraAnchoredViewfinderLine(orient.Origin, endpoint,
+				billboard.Material, orient.VanillaCameraPos, orient.VanillaCameraRotation))
+			{
+				RebakeLineCameraAnchored(billboard, orient, smoothedCameraPos);
+				return;
+			}
+
+			// On foot: solid lines stay anchored to a static world position;
+			// the engine's vanilla quad through our smoothed view matrix renders
+			// at the same screen position as the underlying mesh, so we leave
+			// them alone. Depth-pulled see-through lines sit at camPos + (target
 			// − camPos) × 0.01 in world space; without correction they stay
-			// anchored to the sim-tick camera's position while the rest of
-			// the scene moves with the smoothed camera, producing the wobble
+			// anchored to the sim-tick camera's position while the rest of the
+			// scene moves with the smoothed camera, producing the wobble
 			// proportional to walking speed. Translating their endpoints by
-			// (smoothed − vanilla) × (1 − 0.01) puts them at the
-			// smoothed-camera equivalent position.
-			var spanVec = (Vector3D)orient.Direction * orient.Length;
-			if (spanVec.LengthSquared() >= CameraPulledSpanSq)
+			// (smoothed − vanilla) × (1 − 0.01) puts them at the smoothed-camera
+			// equivalent position. Classify by thickness + near-camera (see the
+			// DepthPulledLineMaxThickness comment for why, not span).
+			var isDepthPulled = orient.Thickness < DepthPulledLineMaxThickness
+				&& Vector3D.DistanceSquared(orient.Origin, orient.VanillaCameraPos) <= CameraAnchoredThresholdSq;
+			if (!isDepthPulled)
 			{
 				// Long span on foot. The "world-anchored" assumption holds for
 				// selection boxes / terminal underlays anchored to a static
@@ -810,19 +1000,18 @@ namespace SmoothFrames
 			// correction to those targets, then re-depth-pull against the
 			// smoothed camera.
 			var origin = orient.Origin;
-			var endpoint = origin + (Vector3D)orient.Direction * orient.Length;
 			var vanillaCam = orient.VanillaCameraPos;
-			var vanillaTargetOrigin = vanillaCam + (origin - vanillaCam) * DepthPullInverseScale;
+			var vanillaTargetOrigin = vanillaCam + (origin - vanillaCam) * DepthPulledOverlay.InverseNearRatio;
 
 			if (BillboardCorrections.TryFindCorrection(vanillaTargetOrigin, out var pulledGridCorrection))
 			{
-				var vanillaTargetEnd = vanillaCam + (endpoint - vanillaCam) * DepthPullInverseScale;
+				var vanillaTargetEnd = vanillaCam + (endpoint - vanillaCam) * DepthPulledOverlay.InverseNearRatio;
 				RebakeLineDepthPulledWithCorrection(billboard, orient, ref pulledGridCorrection,
 					vanillaTargetOrigin, vanillaTargetEnd, smoothedCameraPos);
 				return;
 			}
 
-			var pullDelta = (smoothedCameraPos - vanillaCam) * DepthPullComplement;
+			var pullDelta = (smoothedCameraPos - vanillaCam) * DepthPulledOverlay.Complement;
 			var pulledOrigin = origin + pullDelta;
 			var pulledEnd = pulledOrigin + (Vector3D)orient.Direction * orient.Length;
 
@@ -856,8 +1045,8 @@ namespace SmoothFrames
 			Vector3D.Transform(ref vanillaTargetOrigin, ref correction, out var smoothTargetOrigin);
 			Vector3D.Transform(ref vanillaTargetEnd, ref correction, out var smoothTargetEnd);
 
-			var pulledOrigin = smoothedCameraPos + (smoothTargetOrigin - smoothedCameraPos) * DepthPullScale;
-			var pulledEnd = smoothedCameraPos + (smoothTargetEnd - smoothedCameraPos) * DepthPullScale;
+			var pulledOrigin = smoothedCameraPos + (smoothTargetOrigin - smoothedCameraPos) * DepthPulledOverlay.NearRatio;
+			var pulledEnd = smoothedCameraPos + (smoothTargetEnd - smoothedCameraPos) * DepthPulledOverlay.NearRatio;
 
 			if (Vector3D.IsZero(smoothedCameraPos - pulledOrigin, 1E-06))
 			{

@@ -159,6 +159,98 @@ subjects, no extended body unless asked.
   keeps each class to one concern: the patch only binds Harmony to
   the engine surface, the topic class is the API consumers see.
 
+## Mod-specific recognition
+
+The smoothing engine is mod-agnostic: it reasons about billboard
+*types*, *materials*, and *geometry*, never about which mod emitted a
+thing. The one exception is recognizing see-through-walls overlay
+content a specific mod draws so it can be smoothed. That recognition is
+split in two:
+
+- **The engine talks only to a general recognizer**,
+  `DepthPulledOverlay`. It owns the depth-pull constant (`NearRatio` and
+  friends), the set of overlay materials, and the predicates the engine
+  calls — `IsDepthPulledOverlayQuad` (bulk-emitted Custom quads: conveyor
+  lines/arrows/boxes, LIDAR point cloud) and
+  `IsCameraAnchoredViewfinderLine` (the LIDAR viewfinder square). The
+  engine passes in its own frame state (camera pose, thresholds) and owns
+  the correction mechanics.
+- **The hard-coded mod internals live in a per-mod profile**, in its own
+  `*<ModName>*`-named file (currently `BuildInfoOverlay`): the mod's
+  material ids (folded into the recognizer's set via an `OverlayMaterials`
+  array) and any geometric constants a correction needs (the LIDAR
+  preview frustum's FOV/near-plane/aspect, behind
+  `IsLidarPreviewSquareLine`). A second overlay mod gets its own profile
+  wired into `DepthPulledOverlay` the same way.
+
+Adding a new overlay mod is a code change for now, and only the *materials*
+generalize cleanly: add them to a `*Overlay` profile's `OverlayMaterials`
+and they fold into the recognizer's set automatically. A viewfinder test
+or a different depth-pull ratio still means editing `DepthPulledOverlay`
+itself — `IsCameraAnchoredViewfinderLine` is a single hard-coded profile
+call, and `NearRatio` is one shared constant (the common recovery is
+ratio-insensitive, but the moving-grid un-pull assumes it). A
+runtime-configurable material list, and making the viewfinder/ratio
+per-profile, were considered and deferred until more such mods surface.
+
+Why the Custom quads need material identity at all (and can't be
+recognized geometrically the way the dots and orient-carrying lines are):
+their see-through technique — depth-pull to ~1% of camera distance, draw
+with `BlendTypeEnum.PostPP` — is shared with screen HUD. PostPP is what
+Rich HUD Master and Text HUD API draw their HUD with too; a depth-pulled
+overlay sits so close to the camera it moves almost exactly like
+camera-locked HUD; and the quads are square (arrows, boxes, short
+segments), indistinguishable from HUD glyphs by shape. So the material is
+the only reliable per-element signal. See "Considered and rejected" for
+the full evaluation (and why inverting it — recognize HUD, depth-pull the
+rest — is worse).
+
+The **depth-pull ratio** (`DepthPulledOverlay.NearRatio`, 0.01) is a
+general default, not a constant mirrored from one mod: the common recovery
+(a `Complement` translation) is insensitive to the exact value (sub-mm
+residual for any ratio in 0.001–0.05), and only the moving-grid un-pull
+path (`InverseNearRatio`) is ratio-sensitive, where 0.01 covers the known
+cases.
+
+Rationale for the profile split:
+
+- **Blast radius.** When a mod updates and breaks recognition, there's
+  one file to check, and it's named for the mod.
+- **Graceful degradation, not crashes.** Resolve a mod's identifiers in
+  a way that no-ops when absent — material ids via
+  `MyStringId.GetOrCompute` match the same intern-table entry the mod
+  computes when loaded, and match nothing when it isn't, so the content
+  simply falls back to the generic path.
+- **The engine stays readable.** `BillboardSmoothing` says "if this is a
+  recoverable overlay quad, recover it," not "if this material is
+  `BuildInfo_Square` or …".
+
+Geometric recognition (e.g. the near-camera Point path for conveyor dots,
+the thin-line / tiny-radius depth-pull tests for the Measure tool) that
+happens to target a mod but keys on no mod-specific data stays in the
+engine — it's general, and works for any mod emitting the same shape.
+
+**Corpus survey** (installed mods, June 2026). Confirming the split
+generalizes: across every installed mod, Build Info is the *only* one that
+bulk-emits depth-pulled `Custom` quads — the material-keyed case — via its
+conveyor overlay and LIDAR point cloud. Two other depth-pull-overlay mods
+(both Digi's) need no mod-specific code; the geometric paths catch them:
+
+- **Leak Finder** draws its see-through leak overlay as depth-pulled
+  `AddPointBillboard` points → the near-camera Point path.
+- **Advanced Welding** draws an always-on-top weld-pad box as a thin
+  (0.001) PostPP wireframe of lines, depth-pulled at ratio 0.05 → the
+  thin-line path. Its 0.05 vs our 0.01 default corrects to a sub-mm
+  residual — real-world confirmation that the common translation recovery
+  is ratio-insensitive.
+
+(The Water mod bulk-emits, but its quads are the world-anchored water
+surface — not depth-pulled. The Rich HUD Framework family bulk-emits
+screen HUD — camera-anchored, handled by the ordinal-lerp.) So the
+material list stays Build-Info-only until some new mod bulk-emits
+depth-pulled `Custom` quads; another mod's oriented points/lines, however
+exotic, are already covered.
+
 ## Key engine internals
 
 Engine surfaces this plugin reads, patches, or relies on. Names are
@@ -331,8 +423,58 @@ controls *how* those slots are interpreted:
   radius/angle for `Point`). The actual quad is computed at
   render-frame rate inside `MyBillboardRenderer.GatherInternal`
   using `MyRender11.Environment.Matrices.CameraPosition` — which is
-  already our smoothed value. **These billboards already smooth
-  without intervention.**
+  already our smoothed value. **These smooth without intervention
+  *when the stored origin is a true world coord*** — only the quad's
+  facing depends on the camera, and that's the smoothed one. The
+  exception is a depth-pulled `Point`: Build Info's `/bi cn`
+  conveyor dots store `Position0 = vanillaCam + (port − vanillaCam) ×
+  0.01` (a camera-relative center baked at sim rate), so the engine
+  re-faces the quad each frame but renders it around a frozen center
+  — the dot ghosts. `BillboardSmoothing.TryRebakePointDepthPulled`
+  re-anchors it, gated on the center sitting within the
+  camera-anchored threshold. Note a `Point` can't take the
+  camera-relative transform a HUD `Custom` quad does (`smoothedCam +
+  R_delta · (center − vanillaCam)`): the engine renders a `Point`
+  *relative to the smoothed camera*, so `R_smoothed` cancels in the
+  projection and the dot's screen position collapses to
+  `inv(R_vanilla) · (center − vanillaCam)` — sim-rate-only, a stutter
+  (the first cut shipped this). The fix recovers the true port and
+  re-depth-pulls against the smoothed camera, which collapses to a
+  pure translation `Position0 = posClose + (smoothedCam − vanillaCam)
+  × (1 − 0.01)`; the renderer's smoothed-camera projection then
+  supplies rotation tracking, giving frame-exact motion with no lerp.
+  The conveyor *lines/arrows/boxes* (and their shadows) are `Custom` and
+  were first left on the ordinal-lerp path, but that's the *HUD* smoother
+  — it assumes a stable emission order and sparse screen positions, and
+  the conveyor content violates both (Build Info re-sorts it ~once/sec and
+  frustum-culls per element, and it sits ~2.5 cm apart near the camera
+  inside the 0.5 m sanity gate), so a reshuffle mis-lerps adjacent lines
+  or trips the tree-restructure gate — the occasional line *flicker*,
+  visible even with the camera dead still (the mis-pair is about which
+  line sits at an ordinal, not camera motion). They're now detected by
+  **material** (`DepthPulledOverlay.IsDepthPulledOverlayQuad`): Build Info
+  tags every conveyor quad with a `BuildInfo_Square` /
+  `BuildInfo_ShadowedLine` / `BuildInfo_Arrow` / `BuildInfo_ShadowedArrow`
+  string id no HUD framework or vanilla surface uses, so the match is
+  exact. *Geometry can't do this* — a diagnostic showed short conveyor
+  segments are near-square (aspect ~1.2) and indistinguishable from HUD
+  glyphs, so a 2:1 aspect gate dropped ~70% of real lines; the material
+  key catches long and short alike (verified `detectedConveyor ==
+  eligibleCustom`). Matches route to the same frame-exact depth-pull
+  recovery as the dots (`ApplyDepthPulledOverlayRecovery` — translate all
+  four corners by `(smoothedCam − vanillaCam) × 0.99`; the baked
+  camera-facing perp is left as-is, negligible for a sub-mm-thick line
+  ~3 m out). Detected quads are excluded from the ordinal population
+  (capture and rebake loops apply the *same* classifier so
+  `captureIdx`/`rebakeIdx` stay aligned), which also stops their
+  cull/re-sort count churn from perturbing the HUD lerp. Material ids
+  resolve via the global string table, so if Build Info renames them
+  nothing matches and the content degrades back to the ordinal-lerp
+  rather than crashing. The material list is the one piece of
+  mod-specific knowledge in the plugin; Build Info's lives in its
+  `BuildInfoOverlay` profile and the engine reaches it only through the
+  general `DepthPulledOverlay` recognizer — see the **Mod-specific
+  recognition** section. `BillboardSmoothing` itself stays mod-agnostic.
 - `LocalType.Custom` — slots hold fully baked four-corner world
   positions, computed at sim emission time using
   `MyTransparentGeometry.Camera` (un-smoothed). Covers
@@ -483,13 +625,82 @@ override would be silently overwritten by
 - `MyBillboard.LocalType.Line` and `MyBillboard.LocalType.Point` —
   not baked at sim, the quad is generated on the render thread from
   `MyRender11.Environment.Matrices.CameraPosition` (already our
-  smoothed value). These billboards already smooth correctly without
-  any plugin work; only `Custom` billboards need intercepting.
+  smoothed value). These smooth correctly without plugin work *as
+  long as the stored origin is a true world coord*. Caveat: a `Point`
+  whose center is depth-pulled toward the camera (Build Info `/bi cn`
+  conveyor dots) has a camera-relative center baked at sim rate, so it
+  ghosts and is re-anchored by `TryRebakePointDepthPulled` — see the
+  billboard-pipeline section above.
 
 ## Considered and rejected
 
 Approaches we evaluated but didn't ship, with the reason.
 
+- **Camera-relative transform for depth-pulled `Point` billboards**
+  (Build Info `/bi cn` conveyor dots). First cut at de-ghosting the
+  dots reused the HUD-quad transform: `Position0 = smoothedCam +
+  R_delta · (center − vanillaCam)`.
+  - Tested. Killed the ghost (multiple copies) but left a per-sim-tick
+    stutter. Reverted to depth-pull recovery (pure translation).
+  - Why it stuttered: unlike a `Custom` quad, the engine renders a
+    `Point` *relative to the smoothed camera*, so the projection is
+    `inv(R_smoothed) · (Position0 − smoothedCam)`. Substituting the
+    transform, `R_smoothed` cancels and the screen position reduces to
+    `inv(R_vanilla) · (center − vanillaCam)` — a value built only from
+    sim-tick quantities, so it's frozen within a tick and jumps at the
+    boundary. The depth-pull-recovery formula (`posClose + (smoothedCam
+    − vanillaCam) × 0.99`) instead leaves rotation to the renderer's
+    own smoothed projection, which doesn't cancel. See
+    `TryRebakePointDepthPulled`.
+- **Geometric classifier for depth-pulled conveyor *line* quads**
+  (`/bi cn` lines flickering on Build Info's re-sort). To route the
+  bulk-emitted conveyor lines off the HUD ordinal-lerp and onto
+  depth-pull recovery, the first cut detected them by shape: every
+  corner near the camera + a thin, elongated rectangle (short edge
+  < 2 cm, long edge ≥ 2× short).
+  - Tested. No change — the flicker persisted. Diagnostic logging
+    (`eligibleCustom` / `detectedLines` / per-gate failure counts)
+    showed the aspect gate rejecting ~70% of real conveyor lines:
+    `failAspect` dominated, with a sample short segment at 2.5 mm ×
+    4.5 mm (1.8:1). Switched to material-keying and the flicker went.
+  - Why geometry can't work: conveyor connections come in all lengths,
+    and a *short* segment is near-square after the ×0.01 depth-pull —
+    geometrically identical to a HUD text glyph or icon. No aspect or
+    size threshold separates "short conveyor line" from "HUD quad."
+    The reliable signal is the **material**: Build Info tags its
+    conveyor quads with `BuildInfo_*` string ids nothing else emits, so
+    `DepthPulledOverlay.IsDepthPulledOverlayQuad` matches on those (plus a
+    near-camera sanity gate) and catches long and short alike.
+  - Lesson (again): when a candidate fix doesn't move the symptom,
+    instrument before iterating. The geometric gate *looked* right on
+    paper for the lines I pictured (1-block spans); the log showed the
+    real population was dominated by short segments it silently dropped.
+- **Span-based gate for depth-pulled overlay *lines***
+  (`CameraPulledSpanSq`, the orient-path analogue of the conveyor
+  material key). `RebakeLine` first classified a line as depth-pulled
+  (see-through, needs recovery) vs solid (world-anchored, leave alone)
+  by world-space span: the ×0.01 depth-pull shrinks a line to a tiny
+  span, so `span² < 0.1²` meant "depth-pulled." Span was chosen over
+  distance-from-camera precisely because a solid line can be near the
+  camera (a cockpit edge you're sitting in).
+  - Worked for Build Info's short see-through-walls hairlines and the
+    short conveyor segments, but failed for the Measure tool's long
+    see-through measurement lines: a see-through line is `0.01 × the
+    measurement length`, so a 10 m+ measurement's copy exceeds the span
+    gate and was misclassified as solid → left frozen at the
+    depth-pulled pose (stutter), with a frame-to-frame flip at the
+    boundary (flicker).
+  - Switched to **thickness + near-camera**: the depth-pull also scales
+    *thickness* ×0.01 (≤~1 mm) regardless of the feature's length, while
+    solid lines keep full thickness (≥~cm) even when near — so it keeps
+    the cockpit-edge property span had, without span's length
+    dependence. The same near-camera + tiny-*radius* signal handles
+    depth-pulled point markers in `RebakeAxisAligned` (Measure vertices),
+    so points and lines now share one discriminator.
+  - Lesson: a geometric gate keyed on a quantity the depth-pull scales
+    uniformly with the content (span ∝ length) breaks when the content's
+    real size varies; key on a quantity the depth-pull fixes (thickness/
+    radius are ×0.01 of a roughly-constant base) instead.
 - **Forward camera extrapolation instead of 1-tick-delayed
   interpolation.** Compute the camera as
   `Lerp(prev, curr, 1 + alpha)` so it predicts the next sim tick
@@ -597,3 +808,57 @@ Approaches we evaluated but didn't ship, with the reason.
   With this, third-party mods emitting orient-registered content
   (Build Info, particle systems, etc.) don't perturb the HUD's
   lerp at all.
+- **A zero-knowledge signal for depth-pulled overlay Custom quads**
+  (conveyor lines/arrows/boxes, LIDAR cloud), to drop the material key
+  entirely so *any* overlay mod works without recognition. Every
+  candidate general signal was evaluated and rejected:
+  - *Blend type.* The shared technique is `BlendTypeEnum.PostPP` (the
+    engine's after-post-processing pass, `MyBillboardRenderer.RenderPostPP`).
+    But Rich HUD Master and Text HUD API draw essentially all their HUD
+    with PostPP too, so it can't separate a world overlay from screen HUD.
+  - *Material property.* The overlay materials are private textures whose
+    `TransparentMaterials.sbc` definitions carry no "ignore-depth /
+    always-on-top" flag — the see-through effect is purely the depth-pull
+    geometry + PostPP, so there's no material *property* to key on, only
+    the name.
+  - *Geometry.* Already rejected twice (aspect-ratio gate, span gate) —
+    short segments are square, and arrows/boxes/LIDAR-pixels are square,
+    indistinguishable from HUD glyphs.
+  - *Cross-tick motion.* A depth-pulled overlay sits so close to the
+    camera that across a sim tick it translates by ≈ the camera delta —
+    the same as camera-locked HUD (they differ only by the depth-pull
+    ratio, ~1%). They diverge only under rotation, exactly where the
+    1-tick-delayed camera makes per-element tracking unreliable.
+  - Conclusion: for the bulk-emitted Custom quads the material is the only
+    reliable per-element signal, so it stays — but the *coupling* is
+    generalized: the engine keys on the general `DepthPulledOverlay`
+    recognizer and Build Info's materials are one profile (a new mod adds
+    another). The dots and orient-carrying lines need no material
+    (near-camera `Point`s and hairline lines are rare, so geometry is clean
+    there); only the Custom quads, dominated by HUD, resist.
+- **Inverting the recognition — recognize HUD/known content, depth-pull
+  the unrecognized remainder.** Tempting because it would make *any*
+  overlay mod's quads work (they'd fall in the remainder). Rejected as a
+  strictly worse trade:
+  - The HUD path is *already* the generic mechanism — the per-ordinal
+    lerp smooths any HUD mod without recognizing it (Build Vision via RHM,
+    HUD Compass via Text HUD API, both work with zero mod-specific code).
+    Inverting sacrifices the one path that already generalizes to chase
+    the one that can't.
+  - The "HUD to exclude" set is *harder* to recognize than the overlays:
+    RHM/Text HUD API content has the identical billboard signature to
+    Build Info's overlays (bulk `Custom`, PostPP, near-camera, default
+    parent/CVP), so you'd have to couple to the frameworks' *emission*
+    internals — more mods, more fragile than a stable `BuildInfo_Square`
+    string id — and still break any HUD mod that bulk-emits Custom/PostPP
+    quads directly through the vanilla API.
+  - The failure mode flips from graceful to harsh. Today an *unrecognized
+    overlay* degrades to the HUD lerp (ghost / occasional flicker — a
+    transparent-overlay nuisance). Under the inversion an *unrecognized
+    HUD element* gets the translation-only recovery, which doesn't
+    re-anchor to camera rotation, so it slides across the screen under any
+    view rotation — the primary UI visibly wobbling. And there's no single
+    neutral recovery for both: the depth-pull translation and the
+    camera-relative transform agree under translation and diverge under
+    rotation precisely because one tracks the world and the other the
+    camera.
