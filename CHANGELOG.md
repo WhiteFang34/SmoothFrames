@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.0.3 — 2026-06-06
+
+- Fixed Build Info conveyor overlay (lines, arrows, and dots)
+  ghosting and flickering.
+- Fixed WeaponCore combat HUD text drifting across the screen
+  when rotating the view.
+
 ## v1.0.2 — 2026-05-27
 
 - Fixed block-placement preview ghosting when placing a small grid
