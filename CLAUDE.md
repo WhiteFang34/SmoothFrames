@@ -275,6 +275,17 @@ they're omitted).
 - `MyEntity.Render.RenderObjectIDs` / `MyEntity.WorldMatrix` /
   `MyEntity.EntityId` — render handles, world transform, and the
   `long` we key the prev-pose dictionary by.
+- `MyMechanicalConnectionBlockBase.CreateTopPart` — builds a
+  rotor/hinge/suspension top grid with the top block at
+  `Vector3I.Zero`, so a multi-cell top block (wheels are 3x3, 5x5, …)
+  puts the grid origin on its corner cell, off the spin axis. Lerping
+  that origin between ticks cuts the chord of its arc → the wheel
+  wobbles. The fix is to interpolate about a pivot instead. We pick
+  it the way `MySnapshot`'s constructor (multiplayer grid
+  interpolation) does:
+  `MyGridPhysicalHierarchy.Static.GetPivot(grid)` → the joint's
+  grid-local constraint position (a suspension's `WheelDummy`, a
+  hinge's `BodyA/BPos`); else `Physics.CenterOfMassLocal`.
 - `MyCubeBuilder.Static` (singleton) / `MyCubeBuilder.CurrentGrid`
   (`protected internal`, reflected) — the active block builder and
   the grid the gizmo is snapped to (null = free-floating placement,

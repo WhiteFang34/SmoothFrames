@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Reflection;
 using HarmonyLib;
+using Sandbox.Engine.Physics;
+using Sandbox.Game.Entities;
 using Sandbox.Game.World;
 using Sandbox.ModAPI;
 using VRage.Game.Entity;
@@ -506,6 +508,7 @@ namespace SmoothFrames
 					CurrentPosition = currMatrix.Translation,
 					CurrentRotation = currRot,
 					CurrentScale = currScale,
+					Pivot = entity is MyCubeGrid grid ? GetInterpolationPivot(grid) : Vector3.Zero,
 					IsGrid = isGrid,
 					IsPilotedShip = isGrid && isPilotedShip,
 					CurrentVolume = volume,
@@ -540,6 +543,26 @@ namespace SmoothFrames
 			{
 				AddEntity(subpart, recurseChildren: true);
 			}
+		}
+
+		// Grid-local interpolation pivot, chosen the way MySnapshot picks the
+		// pivot for multiplayer grid interpolation: a grid hung off a rotor,
+		// hinge or suspension pivots on that joint's constraint position (on
+		// its axis — a wheel's axle dummy, a rotor head's axis point), since
+		// it spins about the joint, not its center of mass (a rotor-driven
+		// arm's COM orbits the axis). A free grid pivots on its center of
+		// mass, which is what Havok integrates rotation about. No rigid body
+		// (e.g. a projection) keeps the origin.
+		private static Vector3 GetInterpolationPivot(MyCubeGrid grid)
+		{
+			var jointPivot = MyGridPhysicalHierarchy.Static?.GetPivot(grid);
+			if (jointPivot.HasValue)
+			{
+				return jointPivot.Value;
+			}
+
+			var physics = grid.Physics;
+			return physics != null && physics.HasRigidBody ? physics.CenterOfMassLocal : Vector3.Zero;
 		}
 
 		// Per-axis basis-vector lengths give the scale; dividing each row by

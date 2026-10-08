@@ -36,6 +36,17 @@ namespace SmoothFrames
 		public Quaternion CurrentRotation;
 		public Vector3 CurrentScale;
 
+		// Entity-local point the render thread interpolates about: its world
+		// position is lerped and the pose rebuilt around it, instead of
+		// lerping the origin. A lerped origin cuts the chord of its arc
+		// around a spin axis that doesn't pass through it, pushing the whole
+		// mesh off-axis mid-tick by d·(1 − cos(θ/2)) in a direction that
+		// rotates with the spin — the wheel wobble (a wheel grid's origin is
+		// its block's corner cell, up to ~7 m off the axle). Zero for
+		// non-grids, which keeps origin interpolation; see
+		// CameraCapture.GetInterpolationPivot for the grid choice.
+		public Vector3 Pivot;
+
 		// True when the entity is an IMyCubeGrid. Read on the render thread by
 		// BillboardSmoothing to decide whether to register a moving-grid
 		// correction for line/point billboards whose world origin lies on this

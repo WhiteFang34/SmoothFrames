@@ -494,8 +494,8 @@ namespace SmoothFrames
 			ArtificialHorizonSmoothing.MutateLevelLine();
 		}
 
-		// Reconstruct a captured entity's smoothed pose: lerp position and
-		// scale, slerp rotation against the current alpha, then recompose
+		// Reconstruct a captured entity's smoothed pose: lerp pivot position
+		// and scale, slerp rotation against the current alpha, then recompose
 		// into a single MatrixD. Scale is lerped alongside rotation and
 		// translation so entities whose world matrix carries non-identity
 		// scale (e.g. the parachute canopy's billowing animation) recompose
@@ -508,14 +508,23 @@ namespace SmoothFrames
 		private static MatrixD ComputeSmoothedPose(ref SmoothedEntity entity, double alpha)
 		{
 			var alphaF = (float)alpha;
-			Vector3D.Lerp(ref entity.PreviousPosition, ref entity.CurrentPosition,
-				alpha, out var smoothPos);
 			var smoothRot = Quaternion.Slerp(entity.PreviousRotation, entity.CurrentRotation, alphaF);
 			Vector3.Lerp(ref entity.PreviousScale, ref entity.CurrentScale,
 				alphaF, out var smoothScale);
 
 			MatrixD smoothMatrix = Matrix.CreateScale(smoothScale) * Matrix.CreateFromQuaternion(smoothRot);
-			smoothMatrix.Translation = smoothPos;
+
+			// Lerp the pivot's world position, then place the origin so the
+			// pivot lands there under the smoothed rotation. Exact at both
+			// ticks for any pivot; see SmoothedEntity.Pivot for why the pivot
+			// matters between them.
+			var prevPivot = entity.PreviousPosition
+				+ Vector3D.Transform((Vector3D)(entity.Pivot * entity.PreviousScale), entity.PreviousRotation);
+			var currPivot = entity.CurrentPosition
+				+ Vector3D.Transform((Vector3D)(entity.Pivot * entity.CurrentScale), entity.CurrentRotation);
+			Vector3D.Lerp(ref prevPivot, ref currPivot, alpha, out var smoothPivot);
+
+			smoothMatrix.Translation = smoothPivot - Vector3D.TransformNormal(entity.Pivot, smoothMatrix);
 			return smoothMatrix;
 		}
 
