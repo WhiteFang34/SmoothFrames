@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.0.4 — 2026-10-07
+
+- Fixed spinning wheels wobbling, most visibly on 3x3 and
+  5x5 wheels at speed.
+
 ## v1.0.3 — 2026-06-06
 
 - Fixed Build Info conveyor overlay (lines, arrows, and dots)
