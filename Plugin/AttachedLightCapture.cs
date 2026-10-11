@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using System.Reflection;
 using HarmonyLib;
+using Sandbox.Game.Components;
 using Sandbox.Game.Lights;
 using Sandbox.Game.Weapons;
 using VRage.Game.Entity;
@@ -40,11 +41,8 @@ namespace SmoothFrames
 		// MyRenderComponentCharacter.m_light. Set once by InitLight at
 		// character spawn; never reassigned, so we only need to read the
 		// field. Resolved by name because m_light is private.
-		private static readonly System.Type _characterRenderComponentType =
-			AccessTools.TypeByName("Sandbox.Game.Components.MyRenderComponentCharacter")
-			?? throw Errors.NotResolved("Sandbox.Game.Components.MyRenderComponentCharacter");
 		private static readonly FieldInfo _characterLightField =
-			AccessTools.Field(_characterRenderComponentType, "m_light")
+			AccessTools.Field(typeof(MyRenderComponentCharacter), "m_light")
 			?? throw Errors.NotResolved("MyRenderComponentCharacter.m_light");
 
 		// MyEngineerToolBase.m_toolEffectLight. Single slot swapped between
@@ -86,6 +84,16 @@ namespace SmoothFrames
 		}
 
 		/// <summary>
+		///     Forget every prev-tick pose. Called while capture is suspended
+		///     so a light isn't lerped from wherever it was when capture
+		///     stopped.
+		/// </summary>
+		public static void Reset()
+		{
+			_lastSeenPose.Clear();
+		}
+
+		/// <summary>
 		///     Append every attached <see cref="MyLight"/> on
 		///     <paramref name="entity"/> to <paramref name="dest"/>. Caller
 		///     is expected to have cleared the list. Skips lights whose
@@ -98,8 +106,7 @@ namespace SmoothFrames
 		public static void Collect(MyEntity entity, List<AttachedLightSnapshot> dest)
 		{
 			var renderComp = entity.Render;
-			if (renderComp != null
-				&& _characterRenderComponentType.IsInstanceOfType(renderComp)
+			if (renderComp is MyRenderComponentCharacter
 				&& _characterLightField.GetValue(renderComp) is MyLight headlamp)
 			{
 				AddIfPresent(headlamp, dest);

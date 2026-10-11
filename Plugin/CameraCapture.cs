@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Reflection;
 using HarmonyLib;
 using Sandbox.Engine.Physics;
+using Sandbox.Game.Components;
 using Sandbox.Game.Entities;
 using Sandbox.Game.World;
 using Sandbox.ModAPI;
@@ -176,11 +177,8 @@ namespace SmoothFrames
 		// = relative * Parent.LastWorldMatrix, so a write to the child's
 		// render id gets clobbered every frame from the unsmoothed parent.
 		// Redirect to the cull parent and the child follows automatically.
-		private static readonly Type _characterRenderComponentType =
-			AccessTools.TypeByName("Sandbox.Game.Components.MyRenderComponentCharacter")
-			?? throw Errors.NotResolved("Sandbox.Game.Components.MyRenderComponentCharacter");
 		private static readonly FieldInfo _characterCullRenderIdField =
-			AccessTools.Field(_characterRenderComponentType, "m_cullRenderId")
+			AccessTools.Field(typeof(MyRenderComponentCharacter), "m_cullRenderId")
 			?? throw Errors.NotResolved("MyRenderComponentCharacter.m_cullRenderId");
 
 		// Snapshot captured by SnapAndDefer, held here until PublishPendingSnap
@@ -229,8 +227,25 @@ namespace SmoothFrames
 
 			CameraSnapshot snap = default;
 			FillCameraFields(ref snap, camera, ref world, ref rotationOnly);
-			snap.SmoothedEntities = CollectSmoothedEntities(world.Translation);
-			snap.CaptureTick = _captureTick;
+
+			if (Plugin.InterpolationEnabled)
+			{
+				snap.SmoothedEntities = CollectSmoothedEntities(world.Translation);
+				snap.CaptureTick = _captureTick;
+			}
+			else
+			{
+				// Nothing reads the entity list while interpolation is off,
+				// and walking every block of every nearby grid is the
+				// plugin's main sim-thread cost. Drop the prev-pose history
+				// rather than let it go stale, so the first tick back on
+				// sees every entity as new (no motion, and no settled skip
+				// until the render thread has applied a fresh at-rest
+				// record) instead of lerping across however long the toggle
+				// was off.
+				_lastSeenMatrix.Clear();
+				AttachedLightCapture.Reset();
+			}
 
 			// Defer the publish — see _pendingSnap doc above. The actual
 			// CameraHistory.Push happens in PublishPendingSnap after the
@@ -433,8 +448,7 @@ namespace SmoothFrames
 			var ids = renderComp?.RenderObjectIDs;
 
 			// Redirect characters to their cull parent (see _characterCullRenderIdField).
-			var isCharacterRenderComp = renderComp != null
-				&& _characterRenderComponentType.IsInstanceOfType(renderComp);
+			var isCharacterRenderComp = renderComp is MyRenderComponentCharacter;
 			if (isCharacterRenderComp)
 			{
 				var cullId = (uint)_characterCullRenderIdField.GetValue(renderComp);
