@@ -68,6 +68,18 @@ namespace SmoothFrames
 		// forward of the ship, way outside any registered grid sphere.
 		public bool IsPilotedShip;
 
+		// True when the entity's world matrix has stayed bit-identical since
+		// a record the render thread is known to have applied, so the
+		// renderer already holds its final pose and the vanilla→smoothed
+		// correction is identity. The render thread skips
+		// its pose writes and attached-particle corrections — rewriting an
+		// unchanged matrix every frame still dirties the actor's children
+		// and defeats the renderer's unchanged-actor caches (cull proxies,
+		// instance matrices, merge groups, spot-light shadow projections).
+		// Only grids and light-carrying entities are recorded in this state;
+		// see CameraCapture.AddEntity.
+		public bool Settled;
+
 		// World-space bounding sphere at the current sim tick — pulled from
 		// MyEntity.PositionComp.WorldVolume. Used as the spatial test for
 		// "does this billboard origin belong on this grid" on the render
@@ -156,6 +168,12 @@ namespace SmoothFrames
 		// Entities to keep rigidly attached to the smoothed camera each render
 		// frame. Null when there's nothing to mirror this tick.
 		public SmoothedEntity[] SmoothedEntities;
+
+		// CameraCapture's pass counter for the pass that built
+		// SmoothedEntities; meaningless when that's null. The render thread
+		// reports it back once it has applied the list — see
+		// RenderFrameSmoothing.LastAppliedCaptureTick.
+		public int CaptureTick;
 	}
 
 	/// <summary>

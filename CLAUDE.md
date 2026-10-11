@@ -52,7 +52,8 @@ consistently in code comments and the rest of this doc.
 ## Commit conventions
 
 Reuse the verbs already in this repo's commit history — Added,
-Updated, Fixed, Changed, Removed, Cleaned up. Terse one-line
+Updated, Fixed, Changed, Removed, Cleaned up, and Optimized for a
+change that only makes working code cheaper. Terse one-line
 subjects, no extended body unless asked.
 
 ## Investigation tactics
@@ -332,6 +333,16 @@ they're omitted).
   to this id. We read it via reflection and treat it as the actor
   to smooth for any entity whose render component is
   `MyRenderComponentCharacter`.
+- `MyRenderComponentCubeBlock.UpdateGridParent` /
+  `MyRenderComponentBase.ParentIDs` — every fat block's render objects
+  are parented (`SetParent(i, cell.ParentCullObject, LocalMatrix)`) to
+  its render cell's cull object, which is in the grid's own
+  `RenderObjectIDs`. `ParentIDs` (public, parallel to
+  `RenderObjectIDs`, `uint.MaxValue` = unparented, may be shorter) is
+  the sim-side record of that. `CameraCapture` filters on it: a
+  parented id follows the smoothed cell for free, and writing it is
+  worse than useless (see `MyActor.OnMatrixChange` below). A fat block
+  is only captured when it hosts unparented particles or lights.
 - `MyRenderComponentCharacter.m_light` — private
   `Sandbox.Game.Lights.MyLight`; the character's headlamp
   spotlight, created in `InitLight` and never reassigned. Repositioned
@@ -386,6 +397,26 @@ they're omitted).
   This runs **after** `PostponedUpdate.Apply`, so a write to a
   parented actor is silently overwritten before draw — the reason
   we redirect character writes to the cull parent.
+- `MyActor.OnMatrixChange` / `MyActor.WorldMatrixIndex` — every
+  matrix write (`SetTransforms`, `SetMatrix`) ends in
+  `OnMatrixChange`, which marks every child dirty, re-dirties the
+  actor itself when it has a parent (discarding the value just
+  written), moves its cull proxy, and bumps `WorldMatrixIndex`. That
+  index is the renderer's "has this moved" key — `MyCullProxy`,
+  `MyInstance.UpdateWorldMatrix`, `MyMergeGroupRootComponent` and
+  `MyLightComponent.CheckViewProjection` all skip work while it's
+  unchanged. So a write is never free, even with an identical matrix:
+  rewriting a parked station's cells each render frame cost ~2.5 ms
+  per frame in a 7,400-block scene. Hence the settled skip
+  (`SmoothedEntity.Settled`) — an entity whose world matrix stays
+  bit-identical gets no writes, once the render thread has applied
+  one at-rest record for it
+  (`RenderFrameSmoothing.LastAppliedCaptureTick`). That
+  acknowledgement matters: the render thread only ever sees the
+  newest snapshot, so a frame longer than a sim tick skips one, and
+  an entity whose last write was a mid-tick lerp on the tick it
+  stopped would otherwise stay there — the sim sends nothing more
+  for it.
 - `MyScene11.SetActorParent` — render-thread handler for
   `MyRenderMessageSetParentCullObject`; resolves the sim-side
   `SetParent(child, parent, relative)` call.

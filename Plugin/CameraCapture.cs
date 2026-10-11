@@ -94,7 +94,39 @@ namespace SmoothFrames
 		// Sim-thread-only: each entity's last captured world matrix. Lets us
 		// pair the new tick's matrix with the previous tick's so the render
 		// thread can interpolate between them. Indexed by EntityId.
-		private static readonly Dictionary<long, MatrixD> _lastSeenMatrix = new Dictionary<long, MatrixD>();
+		private static readonly Dictionary<long, LastSeen> _lastSeenMatrix = new Dictionary<long, LastSeen>();
+
+		private struct LastSeen
+		{
+			public MatrixD Matrix;
+
+			// _captureTick this entry was written on. Only entities that
+			// produce a record refresh their entry, so one can sit stale
+			// while its entity is still visited every tick (a ship welder
+			// between welds); pairing a stale matrix as "prev" would lerp
+			// across the whole gap for a tick. An entry not from the
+			// immediately preceding tick is treated as never seen.
+			public int Tick;
+
+			// _captureTick of the first record in the current unbroken run
+			// with a matrix bit-identical to the tick before it; 0 while
+			// the entity is moving.
+			public int RestSince;
+		}
+
+		// Counts CollectSmoothedEntities passes, from 1; see LastSeen.Tick.
+		private static int _captureTick;
+
+		// RenderFrameSmoothing.LastAppliedCaptureTick as read at the start
+		// of this pass. A settled entity relies on the render thread having
+		// written its final pose from an at-rest record, and the render
+		// thread doesn't apply every snapshot: a frame longer than a sim
+		// tick skips one, and a camera cut or disabled interpolation
+		// suspends the writes altogether. An entity whose last write was
+		// lerp(prev, curr, alpha < 1) on the tick it stopped would then be
+		// left there, since the sim sends nothing more for it. So it only
+		// settles once a snapshot from its at-rest run has been applied.
+		private static int _appliedTick;
 
 		// Reused list to avoid an allocation each sim tick. Materialized to a
 		// fresh array on Push so the snapshot is immutable to the render side.
@@ -198,6 +230,7 @@ namespace SmoothFrames
 			CameraSnapshot snap = default;
 			FillCameraFields(ref snap, camera, ref world, ref rotationOnly);
 			snap.SmoothedEntities = CollectSmoothedEntities(world.Translation);
+			snap.CaptureTick = _captureTick;
 
 			// Defer the publish — see _pendingSnap doc above. The actual
 			// CameraHistory.Push happens in PublishPendingSnap after the
@@ -252,6 +285,8 @@ namespace SmoothFrames
 
 			_scratchEntities.Clear();
 			_seenEntityIds.Clear();
+			_captureTick++;
+			_appliedTick = RenderFrameSmoothing.LastAppliedCaptureTick;
 			AttachedLightCapture.BeginTick();
 
 			var character = session.LocalCharacter;
@@ -447,15 +482,22 @@ namespace SmoothFrames
 			// correction available.
 			if (hasAnyValidId || (isGrid && isPilotedShip))
 			{
-				var currMatrix = entity.WorldMatrix;
-				if (!_lastSeenMatrix.TryGetValue(entity.EntityId, out var prevMatrix))
-				{
-					// First time we've seen this entity — fall back to no motion
-					// until we have two snapshots to interpolate.
-					prevMatrix = currMatrix;
-				}
-
-				_lastSeenMatrix[entity.EntityId] = currMatrix;
+				// A render id the renderer positions from a parent actor can't
+				// take a world-space write: MyActor.OnMatrixChange re-dirties
+				// a parented actor straight away, so the value is recomputed
+				// from the parent before draw — but only after the write has
+				// moved the actor's cull proxy and invalidated its cached
+				// world matrix. Every fat block is parented this way
+				// (MyRenderComponentCubeBlock.UpdateGridParent hangs it off
+				// its render cell's cull object, which sits in the grid's own
+				// RenderObjectIDs and carries the smoothed pose down), so on
+				// a large grid these are nearly all the ids there are. The
+				// character's cull id (substituted above) is a root.
+				var writableIds = !hasAnyValidId
+					? Array.Empty<uint>()
+					: isCharacterRenderComp
+						? ids
+						: SelectUnparentedIds(ids, renderComp.ParentIDs);
 
 				// Capture grid bounding spheres so the render thread can detect
 				// billboards whose world origin lies on this grid (Build Info
@@ -495,26 +537,72 @@ namespace SmoothFrames
 					? null
 					: _lightScratch.ToArray();
 
-				DecomposeRotationAndScale(ref prevMatrix, out var prevRot, out var prevScale);
-				DecomposeRotationAndScale(ref currMatrix, out var currRot, out var currScale);
-
-				_scratchEntities.Add(new SmoothedEntity
+				// A fully-parented entity still gets a record when it hosts
+				// unparented effects or lights (ship welder / grinder sparks):
+				// those are corrected from the host's own prev/curr pose.
+				if (writableIds.Length > 0 || (isGrid && isPilotedShip) || attached != null || lights != null)
 				{
-					EntityId = entity.EntityId,
-					RenderObjectIds = hasAnyValidId ? ids : Array.Empty<uint>(),
-					PreviousPosition = prevMatrix.Translation,
-					PreviousRotation = prevRot,
-					PreviousScale = prevScale,
-					CurrentPosition = currMatrix.Translation,
-					CurrentRotation = currRot,
-					CurrentScale = currScale,
-					Pivot = entity is MyCubeGrid grid ? GetInterpolationPivot(grid) : Vector3.Zero,
-					IsGrid = isGrid,
-					IsPilotedShip = isGrid && isPilotedShip,
-					CurrentVolume = volume,
-					AttachedParticles = attached,
-					AttachedLights = lights
-				});
+					var currMatrix = entity.WorldMatrix;
+
+					// Until there are two consecutive snapshots to
+					// interpolate, fall back to no motion.
+					var prevMatrix = currMatrix;
+					var restSince = 0;
+					var settled = false;
+					if (_lastSeenMatrix.TryGetValue(entity.EntityId, out var last) && last.Tick == _captureTick - 1)
+					{
+						prevMatrix = last.Matrix;
+						if (prevMatrix == currMatrix)
+						{
+							restSince = last.RestSince != 0 ? last.RestSince : _captureTick;
+
+							// Every record since restSince has been at rest
+							// and, until now, unsettled — so an applied tick
+							// at or past it means the final pose is written.
+							// See _appliedTick.
+							settled = restSince <= _appliedTick;
+						}
+					}
+
+					_lastSeenMatrix[entity.EntityId] = new LastSeen
+					{
+						Matrix = currMatrix,
+						Tick = _captureTick,
+						RestSince = restSince
+					};
+
+					// A settled non-grid has nothing to do per frame — its
+					// pose write and attached-effect corrections are identity
+					// — unless it carries lights, which have their own
+					// prev/curr (a headlamp turns with the head while the body
+					// stands still). Settled grids keep their record so the
+					// billboard-correction registry and the placement
+					// preview's host lookup see the same set of grids.
+					if (!settled || isGrid || lights != null)
+					{
+						DecomposeRotationAndScale(ref prevMatrix, out var prevRot, out var prevScale);
+						DecomposeRotationAndScale(ref currMatrix, out var currRot, out var currScale);
+
+						_scratchEntities.Add(new SmoothedEntity
+						{
+							EntityId = entity.EntityId,
+							RenderObjectIds = writableIds,
+							PreviousPosition = prevMatrix.Translation,
+							PreviousRotation = prevRot,
+							PreviousScale = prevScale,
+							CurrentPosition = currMatrix.Translation,
+							CurrentRotation = currRot,
+							CurrentScale = currScale,
+							Pivot = entity is MyCubeGrid grid ? GetInterpolationPivot(grid) : Vector3.Zero,
+							IsGrid = isGrid,
+							IsPilotedShip = isGrid && isPilotedShip,
+							Settled = settled,
+							CurrentVolume = volume,
+							AttachedParticles = attached,
+							AttachedLights = lights
+						});
+					}
+				}
 			}
 
 			if (!recurseChildren)
@@ -543,6 +631,54 @@ namespace SmoothFrames
 			{
 				AddEntity(subpart, recurseChildren: true);
 			}
+		}
+
+		// The subset of ids with no render-side parent. Returns the engine's
+		// own array when nothing is parented (the common case for every
+		// entity that has writable ids at all, so no allocation), an empty
+		// array when everything is, and a filtered copy only for a mix.
+		// ParentIDs can be shorter than RenderObjectIDs — it's allocated on
+		// the first SetParent — so a missing slot means unparented.
+		private static uint[] SelectUnparentedIds(uint[] ids, uint[] parentIds)
+		{
+			var valid = 0;
+			var writable = 0;
+			for (var i = 0; i < ids.Length; i++)
+			{
+				if (ids[i] == uint.MaxValue)
+				{
+					continue;
+				}
+
+				valid++;
+				if (parentIds == null || i >= parentIds.Length || parentIds[i] == uint.MaxValue)
+				{
+					writable++;
+				}
+			}
+
+			if (writable == valid)
+			{
+				return ids;
+			}
+
+			if (writable == 0)
+			{
+				return Array.Empty<uint>();
+			}
+
+			var result = new uint[writable];
+			var next = 0;
+			for (var i = 0; i < ids.Length; i++)
+			{
+				if (ids[i] != uint.MaxValue
+					&& (i >= parentIds.Length || parentIds[i] == uint.MaxValue))
+				{
+					result[next++] = ids[i];
+				}
+			}
+
+			return result;
 		}
 
 		// Grid-local interpolation pivot, chosen the way MySnapshot picks the

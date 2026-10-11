@@ -180,6 +180,12 @@ namespace SmoothFrames
 		// before the first valid render frame computes one.
 		public static double LastSmoothingAlpha { get; private set; }
 
+		// CaptureTick of the newest snapshot whose entity records this
+		// thread has applied. Read on the sim thread by CameraCapture, which
+		// won't treat an entity as settled until a record from its at-rest
+		// run is known to have been written.
+		public static volatile int LastAppliedCaptureTick;
+
 		// Vanilla (sim-tick) camera pose snapped at the very start of the
 		// current render frame, before the engine's RefreshRead picks up the
 		// latest billboard CommitWrite inside ProcessMessageQueue. The snap
@@ -442,6 +448,17 @@ namespace SmoothFrames
 			{
 				for (var i = 0; i < entities.Length; i++)
 				{
+					if (entities[i].Settled)
+					{
+						if (entities[i].IsGrid && entities[i].CurrentVolume.Radius > 0)
+						{
+							RegisterSettledGridForBillboardRebake(ref entities[i]);
+						}
+
+						ApplyAttachedLightSmoothing(entities[i].AttachedLights, alpha);
+						continue;
+					}
+
 					var smoothMatrix = ComputeSmoothedPose(ref entities[i], alpha);
 
 					if (entities[i].IsGrid && entities[i].CurrentVolume.Radius > 0)
@@ -469,6 +486,8 @@ namespace SmoothFrames
 
 					ApplyAttachedLightSmoothing(entities[i].AttachedLights, alpha);
 				}
+
+				LastAppliedCaptureTick = curr.CaptureTick;
 			}
 
 			ApplyPlacementPreviewSmoothing(ref world, entities, alpha);
@@ -567,6 +586,22 @@ namespace SmoothFrames
 			if (entity.IsPilotedShip)
 			{
 				BillboardCorrections.SetPilotedShipCorrection(ref correction);
+			}
+		}
+
+		// A settled grid's vanilla and smoothed poses coincide, so both of its
+		// corrections are identity. It still registers: TryFindCorrection is
+		// first-hit over the registered spheres in capture order, and dropping
+		// a parked station from the list would hand a billboard on it to
+		// whichever moving grid's sphere happens to overlap the spot.
+		private static void RegisterSettledGridForBillboardRebake(ref SmoothedEntity entity)
+		{
+			var identity = MatrixD.Identity;
+			BillboardCorrections.Register(entity.CurrentVolume, ref identity, ref identity);
+
+			if (entity.IsPilotedShip)
+			{
+				BillboardCorrections.SetPilotedShipCorrection(ref identity);
 			}
 		}
 
