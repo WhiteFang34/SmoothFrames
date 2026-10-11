@@ -3,6 +3,7 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Reflection;
 using HarmonyLib;
+using Sandbox.Game.Entities;
 using VRage.Game;
 using VRage.Game.Components;
 using VRage.Game.Entity;
@@ -81,6 +82,33 @@ namespace SmoothFrames
 			{
 				accessors[i](entity, dest);
 			}
+		}
+
+		// How many accessors every cube block inherits from MyCubeBlock
+		// itself (its damage-effect fields); resolved on first use.
+		private static int _cubeBlockAccessorCount = -1;
+
+		/// <summary>
+		///     True when the entity's type holds effect references of its
+		///     own — a ship welder's sparks, a thruster's landing effect, a
+		///     turret's muzzle flash — so an effect can start on it at any
+		///     tick. The damage-effect fields every cube block inherits
+		///     don't count: by that measure every block would qualify.
+		/// </summary>
+		public static bool HasOwnEffectFields(MyEntity entity)
+		{
+			var count = GetAccessors(entity.GetType()).Length;
+			if (!(entity is MyCubeBlock))
+			{
+				return count > 0;
+			}
+
+			if (_cubeBlockAccessorCount < 0)
+			{
+				_cubeBlockAccessorCount = GetAccessors(typeof(MyCubeBlock)).Length;
+			}
+
+			return count > _cubeBlockAccessorCount;
 		}
 
 		private static Accessor[] GetAccessors(Type type)

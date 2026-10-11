@@ -817,6 +817,20 @@ Approaches we evaluated but didn't ship, with the reason.
     The actual fix was to mirror the smoothed pose onto the affected
     entities, which made the camera's interpolation strategy a
     non-issue.
+- **Compiled getters for the attached-particle field walk.** Every
+  cube block inherits two effect fields from `MyCubeBlock`
+  (`m_damageEffect`, `m_activeEffects`), so the walk made ~15,000
+  `FieldInfo.GetValue` calls a tick on a 7,400-block scene.
+  Replacing them with `DynamicMethod` getters looked like the fix
+  for the capture's 3 ms.
+  - Tested. No measurable change (3.1 ms before and after).
+    Presumably the reads were never expensive — under Pulsar the
+    game runs on .NET 10, not .NET Framework — but that wasn't
+    measured. The cost was visiting 7,400 objects at all (~0.4 µs
+    each), which is what `WalkGridStaggered` addresses. Reverted.
+  - Lesson (again): instrument before iterating — an offline
+    reflection pass confirmed the reads existed, not that they cost
+    anything.
 - **Install camera matrices at `DrawScene.Prefix` and restore
   vanilla in `DrawScene.Postfix`** instead of installing in the
   `ProcessMessageQueue` postfix and leaving them live. v0 (the

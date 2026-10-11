@@ -19,6 +19,7 @@ namespace SmoothFrames
 		protected override void UnloadData()
 		{
 			CameraHistory.Reset();
+			CameraCapture.DropHistory();
 		}
 
 		public override void HandleInput()

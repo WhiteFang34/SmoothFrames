@@ -129,6 +129,13 @@ namespace SmoothFrames
 		// settles once a snapshot from its at-rest run has been applied.
 		private static int _appliedTick;
 
+		// Staggered-walk state per grid, by EntityId; see WalkGridStaggered.
+		private static readonly Dictionary<long, GridWalk> _gridWalks = new Dictionary<long, GridWalk>();
+
+		// Ticks for the rolling rescan to get round a grid's blocks once —
+		// the longest a newly interesting descendant waits to be noticed.
+		private const int RescanPeriodTicks = 30;
+
 		// Reused list to avoid an allocation each sim tick. Materialized to a
 		// fresh array on Push so the snapshot is immutable to the render side.
 		private static readonly List<SmoothedEntity> _scratchEntities = new List<SmoothedEntity>(8);
@@ -236,15 +243,13 @@ namespace SmoothFrames
 			else
 			{
 				// Nothing reads the entity list while interpolation is off,
-				// and walking every block of every nearby grid is the
-				// plugin's main sim-thread cost. Drop the prev-pose history
-				// rather than let it go stale, so the first tick back on
-				// sees every entity as new (no motion, and no settled skip
-				// until the render thread has applied a fresh at-rest
-				// record) instead of lerping across however long the toggle
-				// was off.
-				_lastSeenMatrix.Clear();
-				AttachedLightCapture.Reset();
+				// and collecting it is the plugin's main sim-thread cost.
+				// Drop the history rather than let it go stale, so the first
+				// tick back on sees every entity as new (no motion, and no
+				// settled skip until the render thread has applied a fresh
+				// at-rest record) instead of lerping across however long
+				// the toggle was off.
+				DropHistory();
 			}
 
 			// Defer the publish — see _pendingSnap doc above. The actual
@@ -269,6 +274,18 @@ namespace SmoothFrames
 			var snap = _pendingSnap;
 			_hasPendingSnap = false;
 			CameraHistory.Push(ref snap);
+		}
+
+		// Forget every prev-tick pose and per-grid walk list. Sim thread
+		// only. Also called on session unload: nothing evicts while there's
+		// no session, so the walk lists would keep the unloaded world's
+		// entities reachable, and reloading the same save would find its
+		// grids' stale walks instead of giving them a first-sight full walk.
+		internal static void DropHistory()
+		{
+			_lastSeenMatrix.Clear();
+			_gridWalks.Clear();
+			AttachedLightCapture.Reset();
 		}
 
 		private static void FillCameraFields(ref CameraSnapshot snap, MyCamera camera,
@@ -328,10 +345,9 @@ namespace SmoothFrames
 			// MyCubeGrid). The recursion then walks each block's
 			// `Subparts.Values` — picking up animated block subparts
 			// (parachute canopy, piston rod, turret barrel, etc.) so they
-			// track the smoothed grid pose between sim ticks. The render-id
-			// check inside AddEntity filters blocks that share the grid's
-			// combined mesh (no own render object), so the cost is dominated
-			// by the few blocks that actually have unique render IDs.
+			// track the smoothed grid pose between sim ticks. A grid's
+			// descendants aren't all visited every tick, though — see
+			// WalkGridStaggered.
 			var controlledEntity = session.ControlledEntity?.Entity;
 			var piloting = controlledEntity != null && controlledEntity != characterEntity;
 			if (piloting)
@@ -379,6 +395,22 @@ namespace SmoothFrames
 			foreach (var t in _evictScratch)
 			{
 				_lastSeenMatrix.Remove(t);
+			}
+
+			// Same for grids that weren't walked this tick (left the capture
+			// radius, or closed).
+			_evictScratch.Clear();
+			foreach (var pair in _gridWalks)
+			{
+				if (pair.Value.Tick != _captureTick)
+				{
+					_evictScratch.Add(pair.Key);
+				}
+			}
+
+			foreach (var t in _evictScratch)
+			{
+				_gridWalks.Remove(t);
 			}
 
 			// Same eviction policy for attached-light prev-pose, keyed by
@@ -431,18 +463,23 @@ namespace SmoothFrames
 			}
 		}
 
-		private static void AddEntity(MyEntity entity, bool recurseChildren, bool isPilotedShip = false)
+		// Returns whether the entity is worth visiting every tick: it produced
+		// a record, or it's of a type that can start emitting effects at any
+		// moment. False for an entity already visited this tick.
+		private static bool AddEntity(MyEntity entity, bool recurseChildren, bool isPilotedShip = false)
 		{
 			if (entity == null)
 			{
-				return;
+				return false;
 			}
 
 			// Skip entities we've already visited this tick. See _seenEntityIds.
 			if (!_seenEntityIds.Add(entity.EntityId))
 			{
-				return;
+				return false;
 			}
+
+			var interesting = false;
 
 			var renderComp = entity.Render;
 			var ids = renderComp?.RenderObjectIDs;
@@ -554,8 +591,11 @@ namespace SmoothFrames
 				// A fully-parented entity still gets a record when it hosts
 				// unparented effects or lights (ship welder / grinder sparks):
 				// those are corrected from the host's own prev/curr pose.
+				interesting = AttachedParticleCapture.HasOwnEffectFields(entity);
 				if (writableIds.Length > 0 || (isGrid && isPilotedShip) || attached != null || lights != null)
 				{
+					interesting = true;
+
 					var currMatrix = entity.WorldMatrix;
 
 					// Until there are two consecutive snapshots to
@@ -621,14 +661,30 @@ namespace SmoothFrames
 
 			if (!recurseChildren)
 			{
-				return;
+				return interesting;
 			}
 
+			if (entity is MyCubeGrid walkedGrid)
+			{
+				WalkGridStaggered(walkedGrid);
+			}
+			else
+			{
+				AddDescendants(entity, null);
+			}
+
+			return interesting;
+		}
+
+		// Visit everything below `entity`. With a walk, each descendant is
+		// also classified into it; without one this is the plain recursion.
+		private static void AddDescendants(MyEntity entity, GridWalk walk)
+		{
 			if (entity.Hierarchy != null)
 			{
 				foreach (var childComponent in entity.Hierarchy.Children)
 				{
-					AddEntity(childComponent.Entity as MyEntity, recurseChildren: true);
+					AddDescendant(childComponent.Entity as MyEntity, walk);
 				}
 			}
 
@@ -643,7 +699,155 @@ namespace SmoothFrames
 
 			foreach (var subpart in entity.Subparts.Values)
 			{
-				AddEntity(subpart, recurseChildren: true);
+				AddDescendant(subpart, walk);
+			}
+		}
+
+		private static void AddDescendant(MyEntity entity, GridWalk walk)
+		{
+			if (entity == null)
+			{
+				return;
+			}
+
+			if (walk == null)
+			{
+				AddEntity(entity, recurseChildren: true);
+				return;
+			}
+
+			// Already captured this tick by another route (the seated pilot,
+			// reached first as the local character): it can't be classified
+			// again, so it keeps whatever standing it had.
+			var interesting = _seenEntityIds.Contains(entity.EntityId)
+				? walk.InterestingIds.Contains(entity.EntityId)
+				: AddEntity(entity, recurseChildren: false);
+			if (interesting)
+			{
+				walk.Note(entity);
+			}
+
+			AddDescendants(entity, walk);
+		}
+
+		// Capture a grid's descendants without walking all of them every
+		// tick. Nearly every fat block is a dead end for the capture — its
+		// render ids are parented and it has no live effect — yet visiting
+		// each one costs ~0.4 µs, and a 7,400-block scene spent ~3 ms a tick
+		// (a fifth of the sim budget, spiking to 10 ms) finding the ~100 that
+		// matter. So the ones that matter are remembered and visited every
+		// tick, and the full set is re-examined a slice at a time, once
+		// round every RescanPeriodTicks, to refresh the list.
+		//
+		// The rescan is the only invalidation there is: nothing listens for
+		// block or subpart changes, so nothing can go permanently stale. The
+		// price is latency — a subpart that just appeared, or a block that
+		// just started smoking, can go up to RescanPeriodTicks before it's
+		// noticed and starts being smoothed.
+		private static void WalkGridStaggered(MyCubeGrid grid)
+		{
+			if (!_gridWalks.TryGetValue(grid.EntityId, out var walk))
+			{
+				// First sight: one full walk, so everything is smoothed from
+				// the tick the grid comes into range.
+				walk = new GridWalk { Tick = _captureTick };
+				_gridWalks.Add(grid.EntityId, walk);
+				AddDescendants(grid, walk);
+				walk.FinishCycle();
+				return;
+			}
+
+			walk.Tick = _captureTick;
+
+			// Scan before visiting the list, so entities in this tick's slice
+			// are classified here rather than deduped away as already seen.
+			if (walk.Cursor == 0 && grid.Subparts != null)
+			{
+				foreach (var subpart in grid.Subparts.Values)
+				{
+					AddDescendant(subpart, walk);
+				}
+			}
+
+			var count = 0;
+			if (grid.Hierarchy != null)
+			{
+				// The list can change under the cursor between ticks (blocks
+				// added or removed); a block skipped or seen twice this round
+				// is picked up correctly on the next.
+				var children = grid.Hierarchy.Children;
+				count = children.Count;
+				var end = Math.Min(count, walk.Cursor + (count + RescanPeriodTicks - 1) / RescanPeriodTicks);
+				for (var i = walk.Cursor; i < end; i++)
+				{
+					AddDescendant(children[i].Entity as MyEntity, walk);
+				}
+				walk.Cursor = end;
+			}
+
+			if (walk.Cursor >= count)
+			{
+				walk.FinishCycle();
+			}
+
+			var interesting = walk.Interesting;
+			for (var i = 0; i < interesting.Count; i++)
+			{
+				// Removed since it was listed; the next cycle drops it.
+				if (interesting[i].Closed || interesting[i].MarkedForClose)
+				{
+					continue;
+				}
+
+				AddEntity(interesting[i], recurseChildren: false);
+			}
+		}
+
+		// Per-grid state for WalkGridStaggered.
+		private sealed class GridWalk
+		{
+			// Descendants visited every tick, and their ids.
+			public List<MyEntity> Interesting = new List<MyEntity>();
+			public readonly HashSet<long> InterestingIds = new HashSet<long>();
+
+			// What the rescan in progress has found; becomes Interesting when
+			// it completes, which is how entities that stopped mattering
+			// drop out.
+			private List<MyEntity> _building = new List<MyEntity>();
+
+			// Next index into the grid's Hierarchy.Children to rescan.
+			public int Cursor;
+
+			// _captureTick the grid was last walked on; a walk that falls
+			// behind belongs to a grid that left range or closed.
+			public int Tick;
+
+			// Record an interesting entity found by the rescan. One that's
+			// new joins the every-tick list straight away rather than
+			// waiting for the cycle to finish.
+			public void Note(MyEntity entity)
+			{
+				_building.Add(entity);
+				if (InterestingIds.Add(entity.EntityId))
+				{
+					Interesting.Add(entity);
+				}
+			}
+
+			public void FinishCycle()
+			{
+				var finished = _building;
+				_building = Interesting;
+				_building.Clear();
+				Interesting = finished;
+
+				InterestingIds.Clear();
+				foreach (var entity in finished)
+				{
+					InterestingIds.Add(entity.EntityId);
+				}
+
+				Cursor = 0;
 			}
 		}
 
