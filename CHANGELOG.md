@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.1.0 — 2026-10-12
+
+- Optimized smoothing around large builds. Grids at rest no
+  longer cost render time every frame.
+- Optimized the per-tick capture of nearby grids, which no
+  longer visits every block on every tick.
+- Optimized the interpolation toggle. Turning it off now
+  stops the capture work as well.
+
 ## v1.0.4 — 2026-10-07
 
 - Fixed spinning wheels wobbling, most visibly on 3x3 and
