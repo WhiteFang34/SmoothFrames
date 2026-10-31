@@ -790,6 +790,19 @@ namespace SmoothFrames
 				walk.FinishCycle();
 			}
 
+			// Seated characters can't wait for the rescan. MyCockpit.AttachPilot
+			// takes the pilot out of MyEntities and hangs it off the seat's
+			// Hierarchy, so only this walk reaches it, and the seat itself
+			// isn't listed (its ids are parented) — a passenger who just sat
+			// down on a moving ship would step at sim rate against the
+			// smoothed hull for up to RescanPeriodTicks. OccupiedBlocks is the
+			// engine's own set of seats with someone in them, kept by
+			// AttachPilot / RemovePilot, so this costs a visit per pilot.
+			foreach (var seat in grid.OccupiedBlocks)
+			{
+				AddEntity(seat.Pilot, recurseChildren: true);
+			}
+
 			var interesting = walk.Interesting;
 			for (var i = 0; i < interesting.Count; i++)
 			{
