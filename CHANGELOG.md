@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.1.1 — 2026-10-31
+
+- Fixed HUD markers on fast-moving grids jittering, more
+  the higher the speed.
+- Fixed characters stuttering for up to half a second after
+  sitting down in a seat on a moving grid.
+
 ## v1.1.0 — 2026-10-12
 
 - Optimized smoothing around large builds. Grids at rest no
