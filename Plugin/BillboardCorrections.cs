@@ -83,8 +83,12 @@ namespace SmoothFrames
 		// pose as the reference (`inv(prev_world) * smoothed_world`) — the
 		// shape HUD markers need because their POI WorldPositions lag by one
 		// sim tick (see the field doc on MovingGridCorrection).
+		// `prevVolumeCenter` is the sphere center carried back to the
+		// previous sim-tick pose, the containment reference for those
+		// stale positions.
 		public static void Register(
 			BoundingSphereD volume,
+			Vector3D prevVolumeCenter,
 			ref MatrixD correction,
 			ref MatrixD prevPoseCorrection)
 		{
@@ -94,6 +98,7 @@ namespace SmoothFrames
 			}
 
 			_movingGrids[_movingGridsCount].VolumeCenter = volume.Center;
+			_movingGrids[_movingGridsCount].PrevVolumeCenter = prevVolumeCenter;
 			var paddedRadius = volume.Radius + GridSpherePadMeters;
 			_movingGrids[_movingGridsCount].VolumeRadiusSq = paddedRadius * paddedRadius;
 			_movingGrids[_movingGridsCount].Correction = correction;
@@ -153,16 +158,23 @@ namespace SmoothFrames
 			return false;
 		}
 
-		// Same containment test as TryFindCorrection but returns the
-		// prev-pose-based correction (`inv(prev_world) * smoothed_world`) —
-		// what HUD markers need because their POI WorldPosition is one sim
-		// tick stale relative to our snapshot. See the field doc on
-		// MovingGridCorrection.PrevPoseCorrection.
+		// Prev-pose counterpart of TryFindCorrection: returns
+		// `inv(prev_world) * smoothed_world`, what HUD markers need because
+		// their POI WorldPosition is one sim tick stale relative to our
+		// snapshot (see the field doc on MovingGridCorrection.PrevPoseCorrection).
+		//
+		// The containment test is against the sphere at that same previous
+		// pose. Testing a stale point against the current sphere misses by a
+		// tick of travel — 3.3 m at 200 m/s — so a marker near the edge of a
+		// fast grid's sphere (or every marker, at mod-enabled speeds of
+		// thousands of m/s) dropped to its uncorrected T-1 position, which
+		// trails the smoothed mesh by 0–1 tick of motion in a sawtooth:
+		// speed-proportional jitter (issue #3).
 		public static bool TryFindPrevPoseCorrection(Vector3D origin, out MatrixD correction)
 		{
 			for (var i = 0; i < _movingGridsCount; i++)
 			{
-				var distSq = Vector3D.DistanceSquared(origin, _movingGrids[i].VolumeCenter);
+				var distSq = Vector3D.DistanceSquared(origin, _movingGrids[i].PrevVolumeCenter);
 				if (distSq > _movingGrids[i].VolumeRadiusSq)
 				{
 					continue;
@@ -185,6 +197,9 @@ namespace SmoothFrames
 	internal struct MovingGridCorrection
 	{
 		public Vector3D VolumeCenter;
+		// VolumeCenter carried to the grid's previous sim-tick pose; the
+		// containment reference for the prev-pose lookup.
+		public Vector3D PrevVolumeCenter;
 		public double VolumeRadiusSq;
 		public MatrixD Correction;
 		// Same shape as Correction (`inv(reference) * smoothed`) but using the

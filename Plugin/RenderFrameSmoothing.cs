@@ -577,7 +577,13 @@ namespace SmoothFrames
 
 			var prevPoseCorrection = prevInv * smoothMatrix;
 
-			BillboardCorrections.Register(entity.CurrentVolume, ref correction, ref prevPoseCorrection);
+			// The sphere center as it sat at the previous tick, for testing
+			// those stale marker positions against the matching pose.
+			var localCenter = Vector3D.Transform(entity.CurrentVolume.Center, currInv);
+			var prevVolumeCenter = Vector3D.Transform(localCenter, prevMatrix);
+
+			BillboardCorrections.Register(entity.CurrentVolume, prevVolumeCenter,
+				ref correction, ref prevPoseCorrection);
 
 			// Piloted ship: stash the current-pose correction in the
 			// dedicated direct-lookup slot too. See
@@ -597,7 +603,8 @@ namespace SmoothFrames
 		private static void RegisterSettledGridForBillboardRebake(ref SmoothedEntity entity)
 		{
 			var identity = MatrixD.Identity;
-			BillboardCorrections.Register(entity.CurrentVolume, ref identity, ref identity);
+			BillboardCorrections.Register(entity.CurrentVolume, entity.CurrentVolume.Center,
+				ref identity, ref identity);
 
 			if (entity.IsPilotedShip)
 			{
